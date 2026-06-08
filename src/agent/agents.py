@@ -374,6 +374,22 @@ async def run_sub_agent(  # noqa: C901
     Returns:
         Structured result dict with summary, findings, and metadata.
     """
+    # Phase 2: route ported sub-agents to the Agent SDK when agent.runtime=sdk.
+    # Only Icinga is ported today; every other agent falls through to the legacy
+    # loop below. Forcing runtime="sdk" on the runner means its SDK branch (which
+    # calls the adapter, not run_sub_agent) cannot re-enter this function.
+    from src.agent.icinga_sdk import ICINGA_AGENT
+    from src.llm import RUNTIME_SDK, get_runtime
+
+    _runtime_cfg = get_config()
+    if agent_type == ICINGA_AGENT and get_runtime(_runtime_cfg) == RUNTIME_SDK:
+        from src.agent.runner import AgentRunner
+
+        logger.info("Routing '%s' sub-agent to the Agent SDK runtime", agent_type)
+        return await AgentRunner(_runtime_cfg, runtime=RUNTIME_SDK).run_sub_agent(
+            agent_type, task, context=context, conversation_history=conversation_history
+        )
+
     from src.agent.orchestrator import _build_client, _cap_tool_result, _trim_history
 
     start = _time.monotonic()

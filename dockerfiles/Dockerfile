@@ -15,7 +15,9 @@ RUN /usr/libexec/s2i/assemble
 FROM registry.access.redhat.com/ubi9/python-311:latest
 
 USER 0
-RUN dnf install -y --nodocs libpq && dnf clean all
+RUN dnf install -y --nodocs libpq nodejs npm && dnf clean all
+# Claude Code CLI: the Agent SDK (agent.runtime: sdk) drives it as a subprocess.
+RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
 
 COPY --from=builder /opt/app-root /opt/app-root
 
@@ -25,16 +27,24 @@ COPY src/ src/
 COPY static/ static/
 COPY config/config.yaml config/config.yaml
 COPY config/prompts/ config/prompts/
+COPY skills/ skills/
 COPY data/ec2_pricing.json data-seed/ec2_pricing.json
 COPY scripts/refresh_pricing.py scripts/refresh_pricing.py
 COPY scripts/refresh_azure_billing.py scripts/refresh_azure_billing.py
 
-RUN mkdir -p /app/data/reports /app/data/debug && \
-    chgrp -R 0 /app && \
-    chmod -R g=u /app
+# Skills-layout bridge: the SDK "project" setting source discovers skills at
+# <cwd>/.claude/skills/, but Parsec ships them under skills/. Symlink so the
+# baked skills are discoverable. /home/claude is a writable HOME for the CLI's
+# own ~/.claude state (kept separate from the project .claude).
+RUN mkdir -p /app/data/reports /app/data/debug /app/.claude /home/claude && \
+    ln -sfn /app/skills /app/.claude/skills && \
+    chgrp -R 0 /app /home/claude && \
+    chmod -R g=u /app /home/claude
 
 ENV PYTHONPATH="/app" \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/claude \
+    CLAUDE_CODE_ACCEPT_TOS=true
 
 USER 1001
 
