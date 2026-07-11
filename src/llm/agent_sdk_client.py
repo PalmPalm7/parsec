@@ -10,9 +10,11 @@ dependency, unit tests with a mocked sys.modules). Attempting to call
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import importlib
 import logging
 import os
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -157,10 +159,23 @@ class AgentSdkClient:
             options_kwargs["skills"] = skills
         if allowed_tools is not None:
             options_kwargs["allowed_tools"] = allowed_tools
+            # ``allowed_tools`` only auto-approves the listed tools; unlisted
+            # tools fall through to permission handling and, without a denying
+            # callback, the agent may attempt tools outside the sandbox (or the
+            # headless query stalls/fails on the permission prompt). Add a
+            # ``can_use_tool`` callback that denies anything not on the whitelist
+            # so the supplied set is actually enforced.
+            options_kwargs["can_use_tool"] = _make_deny_unlisted(sdk, allowed_tools)
         if mcp_servers:
             options_kwargs["mcp_servers"] = mcp_servers
 
         options = sdk.ClaudeAgentOptions(**options_kwargs)
+
+        # ``can_use_tool`` only works in streaming-input mode, so the prompt has
+        # to be an async iterable when the deny callback is active. When
+        # allowed_tools isn't supplied we keep passing the plain string prompt
+        # (backward compatible).
+        query_prompt: Any = _as_input_stream(prompt) if allowed_tools is not None else prompt
 
         text_parts: list[str] = []
         tool_invocations: list[dict[str, Any]] = []
@@ -188,7 +203,7 @@ class AgentSdkClient:
             # async-for, which closes the SDK's async generator and tears down
             # the child CLI process instead of leaking it.
             async with asyncio.timeout(effective_timeout):
-                async for message in sdk.query(prompt=prompt, options=options):
+                async for message in sdk.query(prompt=query_prompt, options=options):
                     if isinstance(message, sdk.AssistantMessage):
                         _ingest_assistant(sdk, message, state)
                     elif isinstance(message, sdk.UserMessage):
@@ -237,6 +252,59 @@ def _import_sdk() -> Any:
             "claude_agent_sdk is not installed. Install with "
             "'pip install claude-agent-sdk' to enable the SDK runtime."
         ) from e
+
+
+async def _as_input_stream(prompt: str) -> AsyncIterator[dict[str, Any]]:
+    """Wrap a string prompt as the single-message async iterable the SDK needs.
+
+    ``can_use_tool`` only works in streaming-input mode; passing a plain string
+    to ``query()`` alongside it raises. This yields one user message equivalent
+    to the original string prompt.
+    """
+    yield {
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+        "parent_tool_use_id": None,
+        "session_id": "default",
+    }
+
+
+def _make_deny_unlisted(sdk: Any, allowed_tools: list[str]) -> Any:
+    """Build a ``can_use_tool`` callback that denies tools not on the whitelist.
+
+    ``allowed_tools`` is checked (and auto-approved) by the SDK before this
+    callback fires, so a whitelisted tool normally never reaches here; anything
+    that does is outside the intended sandbox and is denied. The membership
+    check is a defensive second gate that keeps an explicitly-listed tool
+    working should a future SDK still route it through the callback.
+    """
+
+    async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context: Any) -> Any:
+        if _tool_allowed(tool_name, allowed_tools):
+            return sdk.PermissionResultAllow()
+        return sdk.PermissionResultDeny(
+            message=f"Tool '{tool_name}' is not in the allowed_tools whitelist for this task.",
+        )
+
+    return can_use_tool
+
+
+def _tool_allowed(tool_name: str, allowed_tools: list[str]) -> bool:
+    """Return True if ``tool_name`` matches any whitelist entry.
+
+    Supports exact names, fnmatch wildcards (e.g. ``mcp__reporting__*``) and
+    MCP server-level grants (``mcp__reporting`` allows ``mcp__reporting__tool``).
+    """
+    for pattern in allowed_tools:
+        if tool_name == pattern or fnmatch.fnmatch(tool_name, pattern):
+            return True
+        if (
+            pattern.startswith("mcp__")
+            and "__" not in pattern[len("mcp__") :]
+            and tool_name.startswith(pattern + "__")
+        ):
+            return True
+    return False
 
 
 def _get_section(config: Any, key: str) -> dict[str, Any]:
@@ -288,19 +356,28 @@ def _ingest_assistant(sdk: Any, message: Any, state: dict[str, Any]) -> None:
                     "id": getattr(block, "id", None),
                 }
             )
+        elif isinstance(block, sdk.ToolResultBlock):
+            # The SDK sometimes emits a ToolResultBlock inside AssistantMessage
+            # content rather than a separate UserMessage. Pair it here too, or
+            # the invocation would keep the tool_use but lose its result/is_error.
+            _pair_tool_result(block, state)
 
 
 def _ingest_user(sdk: Any, message: Any, state: dict[str, Any]) -> None:
     """Pair tool_result blocks back to their tool_use entries by id."""
     for block in getattr(message, "content", []) or []:
-        if not isinstance(block, sdk.ToolResultBlock):
-            continue
-        tool_id = getattr(block, "tool_use_id", None)
-        for inv in state["tool_invocations"]:
-            if inv.get("id") == tool_id and "result" not in inv:
-                inv["result"] = getattr(block, "content", None)
-                inv["is_error"] = bool(getattr(block, "is_error", False))
-                break
+        if isinstance(block, sdk.ToolResultBlock):
+            _pair_tool_result(block, state)
+
+
+def _pair_tool_result(block: Any, state: dict[str, Any]) -> None:
+    """Attach a ToolResultBlock's content/is_error to its tool_use entry by id."""
+    tool_id = getattr(block, "tool_use_id", None)
+    for inv in state["tool_invocations"]:
+        if inv.get("id") == tool_id and "result" not in inv:
+            inv["result"] = getattr(block, "content", None)
+            inv["is_error"] = bool(getattr(block, "is_error", False))
+            break
 
 
 def _ingest_result(message: Any, state: dict[str, Any]) -> None:

@@ -73,6 +73,17 @@ class _ResultMessage:
 
 
 @dataclass
+class _PermissionResultAllow:
+    updated_input: dict | None = None
+
+
+@dataclass
+class _PermissionResultDeny:
+    message: str = ""
+    interrupt: bool = False
+
+
+@dataclass
 class _ClaudeAgentOptions:
     """Records the kwargs it was constructed with so tests can inspect them."""
 
@@ -85,6 +96,7 @@ class _ClaudeAgentOptions:
     skills: list | None = None
     allowed_tools: list | None = None
     mcp_servers: dict | None = None
+    can_use_tool: Any = None
 
 
 class _FakeSdk:
@@ -104,8 +116,10 @@ class _FakeSdk:
     TextBlock = _TextBlock
     ToolUseBlock = _ToolUseBlock
     ToolResultBlock = _ToolResultBlock
+    PermissionResultAllow = _PermissionResultAllow
+    PermissionResultDeny = _PermissionResultDeny
 
-    def query(self, *, prompt: str, options: _ClaudeAgentOptions):
+    def query(self, *, prompt, options: _ClaudeAgentOptions):
         self.captured_prompt = prompt
         self.captured_options = options
 
@@ -132,6 +146,8 @@ def fake_sdk(monkeypatch):
     module.TextBlock = fake.TextBlock  # type: ignore[attr-defined]
     module.ToolUseBlock = fake.ToolUseBlock  # type: ignore[attr-defined]
     module.ToolResultBlock = fake.ToolResultBlock  # type: ignore[attr-defined]
+    module.PermissionResultAllow = fake.PermissionResultAllow  # type: ignore[attr-defined]
+    module.PermissionResultDeny = fake.PermissionResultDeny  # type: ignore[attr-defined]
     module.query = fake.query  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
     return fake
@@ -421,7 +437,12 @@ async def test_complete_passes_through_options(fake_sdk):
     assert opts.mcp_servers == {"reporting": {"type": "http", "url": "http://r:8080"}}
     # extra_env merges into env
     assert opts.env.get("OTEL_SERVICE_NAME") == "parsec"
-    assert fake_sdk.captured_prompt == "Investigate cost spike"
+    # allowed_tools is supplied, so a denying can_use_tool callback is wired up
+    # and the prompt is passed as a streaming-input async iterable.
+    assert callable(opts.can_use_tool)
+    assert not isinstance(fake_sdk.captured_prompt, str)
+    messages = [m async for m in fake_sdk.captured_prompt]
+    assert messages[0]["message"]["content"] == "Investigate cost spike"
 
 
 async def test_complete_omits_optional_kwargs_when_not_provided(fake_sdk):
@@ -434,6 +455,64 @@ async def test_complete_omits_optional_kwargs_when_not_provided(fake_sdk):
     assert opts.skills is None
     assert opts.allowed_tools is None
     assert opts.mcp_servers is None
+    # No allowed_tools -> no deny callback and the plain string prompt is kept.
+    assert opts.can_use_tool is None
+    assert fake_sdk.captured_prompt == "hi"
+
+
+async def test_complete_denies_tools_outside_allowed_list(fake_sdk):
+    """The wired can_use_tool callback denies unlisted tools and allows listed ones."""
+    fake_sdk.stream = [_ResultMessage(model="m", usage={})]
+    client = AgentSdkClient(AgentSdkConfig(model="m"))
+    await client.complete(
+        prompt="do work",
+        allowed_tools=["Read", "mcp__reporting__*"],
+    )
+    can_use_tool = fake_sdk.captured_options.can_use_tool
+    assert callable(can_use_tool)
+
+    # Listed exact tool -> allowed.
+    allow = await can_use_tool("Read", {}, None)
+    assert isinstance(allow, _PermissionResultAllow)
+    # Listed via wildcard -> allowed.
+    allow_wild = await can_use_tool("mcp__reporting__run_query", {}, None)
+    assert isinstance(allow_wild, _PermissionResultAllow)
+    # Unlisted tool -> denied with a message.
+    deny = await can_use_tool("Bash", {"command": "rm -rf /"}, None)
+    assert isinstance(deny, _PermissionResultDeny)
+    assert "Bash" in deny.message
+
+
+async def test_complete_empty_allowed_tools_denies_everything(fake_sdk):
+    """An empty allow-list is a strict sandbox: every tool is denied."""
+    fake_sdk.stream = [_ResultMessage(model="m", usage={})]
+    client = AgentSdkClient(AgentSdkConfig(model="m"))
+    await client.complete(prompt="do work", allowed_tools=[])
+    can_use_tool = fake_sdk.captured_options.can_use_tool
+    assert callable(can_use_tool)
+    deny = await can_use_tool("Read", {}, None)
+    assert isinstance(deny, _PermissionResultDeny)
+
+
+async def test_complete_pairs_tool_result_embedded_in_assistant_message(fake_sdk):
+    """A ToolResultBlock carried inside AssistantMessage.content is still paired."""
+    fake_sdk.stream = [
+        _AssistantMessage(
+            content=[
+                _ToolUseBlock(name="Read", input={"path": "/etc/hosts"}, id="t1"),
+                _ToolResultBlock(tool_use_id="t1", content="127.0.0.1 localhost"),
+            ]
+        ),
+        _ResultMessage(model="m", usage={}),
+    ]
+    client = AgentSdkClient(AgentSdkConfig(model="m"))
+    result = await client.complete(prompt="Read hosts file")
+
+    assert len(result.tool_invocations) == 1
+    inv = result.tool_invocations[0]
+    assert inv["name"] == "Read"
+    assert inv["result"] == "127.0.0.1 localhost"
+    assert inv["is_error"] is False
 
 
 async def test_complete_uses_config_max_turns_when_not_overridden(fake_sdk):

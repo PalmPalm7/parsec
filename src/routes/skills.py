@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 
 from src.config import get_config
+from src.routes.query import _check_user_allowed
 from src.skills import SkillLoader, SkillManifest
 
 logger = logging.getLogger(__name__)
@@ -41,8 +42,15 @@ def _serialize(m: SkillManifest) -> dict:
 
 
 @router.get("/skills")
-async def list_skills():
+async def list_skills(
+    request: Request,
+    x_forwarded_user: str | None = Header(None),
+    x_forwarded_email: str | None = Header(None),
+):
     """Return all discoverable skills across configured sources."""
+    user = x_forwarded_email or x_forwarded_user
+    await _check_user_allowed(request, user)
+
     try:
         loader = SkillLoader.from_config(get_config())
         manifests = loader.load_all()
