@@ -38,8 +38,10 @@ def test_load_all_finds_only_valid_skills_and_skips_broken_ones():
     assert "valid-minimal" in names
     assert "valid-with-parsec" in names
     assert "unknown-parsec-key" in names
+    # A skill that omits `name` defaults to its directory name (spec-compliant),
+    # so the missing-name fixture loads under that name rather than being dropped.
+    assert "missing-name" in names
     # Broken ones must NOT appear
-    assert "missing-name" not in names
     assert "invalid-yaml" not in names
 
 
@@ -129,6 +131,58 @@ def test_parsec_extensions_parsed_in_full():
     assert m.allowed_tools == ("Bash", "Read", "mcp__reporting__*")
 
 
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("Read Grep", ("Read", "Grep")),
+        ("Read, Grep", ("Read", "Grep")),
+        ("Read,  Grep   Bash", ("Read", "Grep", "Bash")),
+        ("Read", ("Read",)),
+    ],
+)
+def test_allowed_tools_accepts_string_forms(tmp_path: Path, value: str, expected: tuple):
+    """Claude Code allows allowed-tools as a space/comma-separated string, not just a list."""
+    skill_dir = tmp_path / "string-tools"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: string-tools\ndescription: declares allowed-tools as a plain string value\n"
+        f"allowed-tools: {value}\n---\n"
+    )
+
+    loader = SkillLoader([SkillSource(label="project", root=tmp_path)])
+    manifests = loader.load_strict()
+    assert manifests[0].allowed_tools == expected
+
+
+def test_allowed_tools_rejects_non_list_non_string(tmp_path: Path):
+    """A mapping (or other non-list/non-string) for allowed-tools is still rejected."""
+    skill_dir = tmp_path / "bad-tools"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: bad-tools\ndescription: allowed-tools given as a mapping is invalid here\n"
+        "allowed-tools:\n  nope: true\n---\n"
+    )
+
+    loader = SkillLoader([SkillSource(label="project", root=tmp_path)])
+    with pytest.raises(SkillValidationError) as exc:
+        loader.load_strict()
+    assert exc.value.field == "allowed-tools"
+
+
+def test_requires_mcp_scalar_string_is_single_item(tmp_path: Path):
+    """A scalar requires_mcp must be one server name, not split into characters."""
+    skill_dir = tmp_path / "scalar-mcp"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: scalar-mcp\ndescription: declares a single MCP dependency as a YAML scalar\n"
+        "parsec:\n  version: 1.0.0\n  requires_mcp: reporting\n---\n"
+    )
+
+    loader = SkillLoader([SkillSource(label="project", root=tmp_path)])
+    manifests = loader.load_strict()
+    assert manifests[0].parsec.requires_mcp == ("reporting",)
+
+
 def test_unknown_parsec_key_loads_with_warning():
     loader = SkillLoader([_src()])
     manifests = {m.name: m for m in loader.load_all()}
@@ -148,11 +202,27 @@ def test_strict_load_surfaces_validation_errors():
         loader.load_strict()
 
 
-def test_missing_name_raises_validation_error_in_strict_mode(tmp_path: Path):
-    """Isolated reproduction of the missing-name fixture failure mode."""
+def test_missing_name_defaults_to_directory_name(tmp_path: Path):
+    """Per the Claude Code spec, an omitted `name` defaults to the skill dir name."""
     skill_dir = tmp_path / "no-name"
     skill_dir.mkdir()
-    (skill_dir / "SKILL.md").write_text("---\ndescription: hi there\n---\n\nbody\n")
+    (skill_dir / "SKILL.md").write_text(
+        "---\ndescription: valid skill that omits name and relies on the folder\n---\n\nbody\n"
+    )
+
+    loader = SkillLoader([SkillSource(label="project", root=tmp_path)])
+    manifests = loader.load_strict()
+    assert len(manifests) == 1
+    assert manifests[0].name == "no-name"
+
+
+def test_missing_name_with_invalid_directory_name_still_raises(tmp_path: Path):
+    """Defaulting to the folder name still enforces kebab-case validity."""
+    skill_dir = tmp_path / "Bad_Name"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\ndescription: omits name and the folder name is not valid kebab-case\n---\n\nbody\n"
+    )
 
     loader = SkillLoader([SkillSource(label="project", root=tmp_path)])
     with pytest.raises(SkillValidationError) as exc:

@@ -41,7 +41,11 @@ class ParsecExtensions:
         extra = {k: v for k, v in data.items() if k not in _KNOWN_PARSEC_KEYS}
         # Normalize requires_mcp into a tuple to keep ParsecExtensions hashable-shape.
         requires = known.get("requires_mcp")
-        if requires is not None:
+        if isinstance(requires, str):
+            # A single dependency given as a YAML scalar, e.g. `requires_mcp: reporting`.
+            # tuple("reporting") would explode into characters, so wrap it as one item.
+            known["requires_mcp"] = (requires,)
+        elif requires is not None:
             known["requires_mcp"] = tuple(requires)
         return cls(**known, extra=extra)
 

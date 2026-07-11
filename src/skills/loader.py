@@ -165,8 +165,19 @@ class SkillLoader:
             warnings.append(f"unknown parsec.* keys ignored: {sorted(parsec_ext.extra)}")
 
         allowed_tools_raw = data.get("allowed-tools") or []
-        if allowed_tools_raw and not isinstance(allowed_tools_raw, list):
-            raise SkillValidationError(skill_md, "allowed-tools", "must be a list of strings")
+        if isinstance(allowed_tools_raw, str):
+            # Claude Code accepts allowed-tools as a space- or comma-separated
+            # string (e.g. "Read Grep") in addition to a YAML list. Split on any
+            # run of whitespace/commas and drop empties.
+            allowed_tools_list = [t for t in re.split(r"[\s,]+", allowed_tools_raw.strip()) if t]
+        elif isinstance(allowed_tools_raw, list):
+            allowed_tools_list = allowed_tools_raw
+        else:
+            raise SkillValidationError(
+                skill_md,
+                "allowed-tools",
+                "must be a list of strings or a space/comma-separated string",
+            )
 
         metadata = data.get("metadata") or {}
         if metadata and not isinstance(metadata, dict):
@@ -178,7 +189,7 @@ class SkillLoader:
             skill_path=skill_dir,
             skill_md_path=skill_md,
             body=body,
-            allowed_tools=tuple(allowed_tools_raw),
+            allowed_tools=tuple(allowed_tools_list),
             license=data.get("license"),
             metadata=metadata,
             parsec=parsec_ext,
@@ -248,8 +259,15 @@ def _validate(skill_md: Path, skill_dir: Path, data: dict[str, Any]) -> list[str
     warnings: list[str] = []
 
     name = data.get("name")
-    if not name or not isinstance(name, str):
-        raise SkillValidationError(skill_md, "name", "required string field")
+    if name is not None and not isinstance(name, str):
+        raise SkillValidationError(skill_md, "name", "must be a string if present")
+    if not name:
+        # The Claude Code skill spec makes `name` optional and uses the skill
+        # directory name as the command name. Default to it so valid skills that
+        # omit `name` still load instead of being dropped. Write it back so the
+        # manifest built in _load_one picks up the resolved name.
+        name = skill_dir.name
+        data["name"] = name
     if not _NAME_RE.match(name):
         raise SkillValidationError(
             skill_md, "name", f"must match {_NAME_RE.pattern!r} (got {name!r})"
