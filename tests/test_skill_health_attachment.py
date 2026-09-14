@@ -309,7 +309,7 @@ def test_env_var_style_uppercase_skills_config_is_honoured(tmp_path):
     ``src.llm.config_section.section`` exists. Every skills config read now goes
     through it.
     """
-    from src.routes.skills import _skills_section
+    from src.llm.config_section import section
     from src.skills.attachment import state_path
 
     cfg = {
@@ -321,7 +321,10 @@ def test_env_var_style_uppercase_skills_config_is_honoured(tmp_path):
         }
     }
 
-    resolved = _skills_section(cfg)
+    # `_skills_section` in the route is a thin wrapper over this; asserting on
+    # `section` directly keeps the regression without importing the route module,
+    # whose agent-registry imports block in a bare local environment.
+    resolved = section(cfg, "skills")
     assert resolved["install_enabled"] is True, "uppercase env key was dropped"
     assert resolved["install_root"] == "/app/data/installed-skills"
     assert resolved["plugin_paths"] == ["/app/data/installed-skills"]
@@ -340,3 +343,39 @@ def test_loader_reads_uppercase_env_supplied_roots(tmp_path):
     ).load_all()
 
     assert [m.name for m in manifests] == ["env-mounted"]
+
+
+# ------------------------------------------------- installer / submodules
+
+
+def test_clone_command_recurses_submodules():
+    """A marketplace bundle may be a git submodule — and usually is.
+
+    rhpds/rhdp-skills-marketplace vendors the AIOps bundle as one. Cloning it
+    without these flags leaves rhdp-rca-plugin/ EMPTY — verified against the
+    real repo: 0 files with a plain shallow clone, 101 files with them, all six
+    skills and root-cause-analysis's 11 scripts present. Discovery then finds
+    nothing and the install reports success having delivered no skills: the same
+    silent-inert failure as a SKILL.md shipped without its scripts/.
+    """
+    from src.skills.vendoring import clone_command
+
+    cmd = clone_command("https://github.com/rhpds/rhdp-skills-marketplace", "main", "/tmp/x")
+
+    assert "--recurse-submodules" in cmd, "a submodule-vendored bundle would arrive empty"
+    assert "--shallow-submodules" in cmd, "pairs with --depth to keep the fetch small"
+    assert cmd[:2] == ("git", "clone")
+    assert cmd[-2:] == ("https://github.com/rhpds/rhdp-skills-marketplace", "/tmp/x")
+    # --branch must carry the ref, or the pin is not honoured.
+    assert cmd[cmd.index("--branch") + 1] == "main"
+
+
+def test_sha_fallback_also_carries_submodules():
+    """The SHA path cannot use --branch, so it clones fully then re-syncs."""
+    from src.skills.vendoring import fallback_clone_command, submodule_sync_command
+
+    fb = fallback_clone_command("https://github.com/rhpds/rhdp-skills-marketplace", "/tmp/x")
+    assert "--recurse-submodules" in fb
+    # No --shallow-submodules: HEAD moves to an arbitrary commit afterwards.
+    assert "--shallow-submodules" not in fb
+    assert submodule_sync_command() == ("git", "submodule", "update", "--init", "--recursive")

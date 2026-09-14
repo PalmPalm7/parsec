@@ -54,6 +54,11 @@ from src.skills.attachment import (
 )
 from src.skills.health import assess, build_tool_surface
 from src.skills.sdk_root import sdk_skills_root
+from src.skills.vendoring import (
+    clone_command,
+    fallback_clone_command,
+    submodule_sync_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -562,20 +567,11 @@ async def _clone_and_install(
     """
     with tempfile.TemporaryDirectory(prefix="skill-install-") as tmp:
         clone_dir = Path(tmp) / "repo"
-        rc, _, err = await _run(
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            ref,
-            "--single-branch",
-            repo_url,
-            str(clone_dir),
-        )
+        rc, _, err = await _run(*clone_command(repo_url, ref, clone_dir))
         if rc != 0:
-            # A SHA cannot be used with --branch; fall back to a full clone + checkout.
-            rc2, _, err2 = await _run("git", "clone", repo_url, str(clone_dir))
+            # A SHA cannot be used with --branch; fall back to a full clone +
+            # checkout, then re-sync submodules against what that ref pins.
+            rc2, _, err2 = await _run(*fallback_clone_command(repo_url, clone_dir))
             if rc2 != 0:
                 raise HTTPException(
                     status_code=400, detail=f"git clone failed: {err.strip() or err2.strip()}"
@@ -585,6 +581,7 @@ async def _clone_and_install(
                 raise HTTPException(
                     status_code=400, detail=f"git checkout {ref} failed: {err3.strip()}"
                 )
+            await _run(*submodule_sync_command(), cwd=str(clone_dir))
 
         rc, sha_out, _ = await _run("git", "rev-parse", "HEAD", cwd=str(clone_dir))
         sha = sha_out.strip() if rc == 0 else "unknown"
