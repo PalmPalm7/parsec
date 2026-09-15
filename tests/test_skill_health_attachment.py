@@ -487,3 +487,19 @@ def test_canonical_root_wins_so_scripts_survive(tmp_path):
 
     assert manifest.name == "showroom-create-lab"
     assert (manifest.skill_path / "scripts" / "build.py").is_file()
+
+
+def test_sdk_cwd_reads_uppercase_env_supplied_keys(monkeypatch):
+    """Startup and reload must resolve the same SDK root.
+
+    ``src/app.py`` used to chain ``cfg.get("agent", {}).get("sdk", {})`` by
+    hand, which misses the UPPERCASE keys Dynaconf materialises for env-supplied
+    settings — so a cwd set via PARSEC_AGENT__SDK__CWD published into one root
+    at startup and a different one on reload.
+    """
+    from src.skills.sdk_root import sdk_cwd
+
+    assert sdk_cwd({"AGENT": {"SDK": {"CWD": "/srv/parsec"}}}) == "/srv/parsec"
+    assert sdk_cwd({"agent": {"sdk": {"cwd": "/srv/parsec"}}}) == "/srv/parsec"
+    assert sdk_cwd({"agent": {"sdk": {}}}) is None
+    assert sdk_cwd({}) is None

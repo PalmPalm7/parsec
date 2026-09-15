@@ -54,7 +54,7 @@ from src.skills.attachment import (
 )
 from src.skills.health import assess, build_tool_surface
 from src.skills.loader import QUALIFIED_NAME_RE, SkillSource
-from src.skills.sdk_root import sdk_skills_root
+from src.skills.sdk_root import sdk_cwd, sdk_skills_root
 from src.skills.vendoring import (
     clone_command,
     discover_skill_roots,
@@ -87,10 +87,7 @@ _REPO_RE = re.compile(r"^https://([a-zA-Z0-9.-]+)/([\w.-]+/[\w.-]+?)(?:\.git)?$"
 
 def _sdk_cwd(cfg: Any) -> str | None:
     """The cwd the SDK subprocess uses, which is also where its skills root lives."""
-    try:
-        return section(section(cfg, "agent"), "sdk").get("cwd") or None
-    except Exception:
-        return None
+    return sdk_cwd(cfg)
 
 
 def _skills_section(cfg: Any) -> dict[str, Any]:
