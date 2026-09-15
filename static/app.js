@@ -346,7 +346,10 @@ function buildInstallForm() {
 
     const subdir = el("input", "skills-input");
     subdir.type = "text";
-    subdir.value = "skills";
+    // Blank means "search the whole clone". Pre-filling "skills" is what made a
+    // marketplace install quietly miss every bundle that keeps its skills
+    // elsewhere — including the RCA one, which lives in a submodule.
+    subdir.placeholder = "leave blank to search the whole repo";
     subdir.setAttribute("aria-label", "Subdirectory containing skill folders");
 
     const only = el("input", "skills-input");
@@ -362,7 +365,9 @@ function buildInstallForm() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify((function() {
-                const b = { repo_url: repo.value.trim(), ref: ref.value.trim(), subdir: subdir.value.trim() };
+                const b = { repo_url: repo.value.trim(), ref: ref.value.trim() };
+                const sd = subdir.value.trim();
+                if (sd) b.subdir = sd;
                 const picked = only.value.split(",").map(function(x) { return x.trim(); }).filter(Boolean);
                 if (picked.length) b.skills = picked;
                 return b;
@@ -386,7 +391,7 @@ function buildInstallForm() {
     form.appendChild(repo);
     form.appendChild(el("div", "skills-install-label", "Ref (pin to a SHA for production)"));
     form.appendChild(ref);
-    form.appendChild(el("div", "skills-install-label", "Subdirectory"));
+    form.appendChild(el("div", "skills-install-label", "Subdirectory (optional — blank searches the whole repo)"));
     form.appendChild(subdir);
     form.appendChild(el("div", "skills-install-label", "Install only these (recommended — a whole repo drags in skills that cannot run here)"));
     form.appendChild(only);
