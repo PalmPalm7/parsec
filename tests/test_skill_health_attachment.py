@@ -379,3 +379,111 @@ def test_sha_fallback_also_carries_submodules():
     # No --shallow-submodules: HEAD moves to an arbitrary commit afterwards.
     assert "--shallow-submodules" not in fb
     assert submodule_sync_command() == ("git", "submodule", "update", "--init", "--recursive")
+
+
+# --------------------------------------------------------------- marketplace
+
+
+def _write_bundle_skill(d: Path, *, name: str, extra: dict[str, str] | None = None) -> Path:
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(
+        f"---\nname: {name}\n"
+        "description: A skill with a description long enough to pass validation.\n"
+        "---\n\nbody\n"
+    )
+    for rel, content in (extra or {}).items():
+        target = d / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    return d
+
+
+def test_namespaced_marketplace_name_loads_and_is_flattened(tmp_path):
+    """Every RHDP marketplace skill is named ``bundle:skill``.
+
+    The loader used to reject the colon, so installing the marketplace put files
+    on disk and then silently discovered none of them.
+    """
+    from src.skills.loader import SkillLoader, SkillSource
+
+    root = tmp_path / "plugins"
+    _write_bundle_skill(root / "agnosticv-validator", name="agnosticv:validator")
+
+    manifests = SkillLoader([SkillSource("plugin", root)]).load_all()
+
+    assert [m.name for m in manifests] == ["agnosticv-validator"]
+    assert manifests[0].qualified_name == "agnosticv:validator"
+    # The flattened name matches the directory, so no spurious mismatch warning.
+    assert not any("does not match folder name" in w for w in manifests[0].warnings)
+
+
+def test_plain_name_keeps_no_qualified_name(tmp_path):
+    from src.skills.loader import SkillLoader, SkillSource
+
+    root = tmp_path / "plugins"
+    _write_bundle_skill(root / "root-cause-analysis", name="root-cause-analysis")
+
+    (manifest,) = SkillLoader([SkillSource("plugin", root)]).load_all()
+    assert manifest.qualified_name is None
+
+
+@pytest.mark.parametrize("bad", ["Bad:Name", "a::b", ":x", "x:", "has space"])
+def test_qualified_name_regex_still_rejects_unsafe_names(bad):
+    from src.skills.loader import QUALIFIED_NAME_RE
+
+    assert not QUALIFIED_NAME_RE.match(bad)
+
+
+def test_discover_skill_roots_prefers_canonical_over_aggregate(tmp_path):
+    """The aggregate dir holds SKILL.md-only entries; canonical dirs hold scripts.
+
+    Installing from the aggregate reproduces the exact defect this installer
+    exists to prevent, so canonical roots must be searched first.
+    """
+    from src.skills.vendoring import discover_skill_roots
+
+    clone = tmp_path / "repo"
+    _write_bundle_skill(
+        clone / "agnosticv" / "skills" / "validator",
+        name="agnosticv:validator",
+        extra={"scripts/run.sh": "#!/bin/sh\n"},
+    )
+    _write_bundle_skill(clone / "skills" / "agnosticv-validator", name="agnosticv:validator")
+
+    roots = discover_skill_roots(clone)
+
+    assert roots == [clone / "agnosticv" / "skills", clone / "skills"]
+
+
+def test_discover_skill_roots_ignores_directories_without_skills(tmp_path):
+    """``docs/skills/`` in the marketplace holds Jekyll pages, not skills."""
+    from src.skills.vendoring import discover_skill_roots
+
+    clone = tmp_path / "repo"
+    (clone / "docs" / "skills").mkdir(parents=True)
+    (clone / "docs" / "skills" / "root-cause-analysis.md").write_text("# page\n")
+    _write_bundle_skill(
+        clone / "rhdp-rca-plugin" / "skills" / "root-cause-analysis", name="root-cause-analysis"
+    )
+
+    assert discover_skill_roots(clone) == [clone / "rhdp-rca-plugin" / "skills"]
+
+
+def test_canonical_root_wins_so_scripts_survive(tmp_path):
+    """End-to-end of the ordering: the manifest kept is the one with scripts."""
+    from src.skills.loader import SkillLoader, SkillSource
+    from src.skills.vendoring import discover_skill_roots
+
+    clone = tmp_path / "repo"
+    _write_bundle_skill(
+        clone / "showroom" / "skills" / "create-lab",
+        name="showroom:create-lab",
+        extra={"scripts/build.py": "print('x')\n"},
+    )
+    _write_bundle_skill(clone / "skills" / "showroom-create-lab", name="showroom:create-lab")
+
+    roots = discover_skill_roots(clone)
+    (manifest,) = SkillLoader([SkillSource("plugin", r) for r in roots]).load_all()
+
+    assert manifest.name == "showroom-create-lab"
+    assert (manifest.skill_path / "scripts" / "build.py").is_file()

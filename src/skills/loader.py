@@ -22,8 +22,32 @@ _FRONTMATTER_RE = re.compile(
     re.DOTALL,
 )
 
-# Anthropic spec: name is "Lowercase + hyphens, matches folder"
+# Anthropic spec: name is "Lowercase + hyphens, matches folder".
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+# Claude Code plugin marketplaces namespace their skills as ``bundle:skill``
+# (e.g. ``agnosticv:catalog-builder``) while the directory on disk stays
+# ``agnosticv-catalog-builder``. Every skill in the RHDP Skills Marketplace is
+# written that way, so a loader that only accepts ``_NAME_RE`` rejects the whole
+# marketplace — the files install, and then all of them are skipped with a log
+# line nobody reads. Accept the qualified form and flatten the separator to a
+# hyphen, which is exactly the directory name the bundle already ships.
+QUALIFIED_NAME_RE = re.compile(r"^(?:[a-z0-9][a-z0-9-]*:)?[a-z0-9][a-z0-9-]*$")
+
+#: Separator a marketplace uses between bundle and skill.
+NAMESPACE_SEP = ":"
+
+
+def normalize_skill_name(name: str) -> str:
+    """Flatten ``bundle:skill`` to ``bundle-skill``.
+
+    The rest of Parsec addresses skills by a path-safe name: they become
+    directory names under the SDK skill root and path parameters on
+    ``/api/skills/{name}/...``. Normalizing here keeps that single spelling
+    while :attr:`SkillManifest.qualified_name` preserves what the author wrote.
+    """
+    return name.replace(NAMESPACE_SEP, "-")
+
 
 # Cap SKILL.md size before reading. Frontmatter + markdown is tiny, so 1 MiB is
 # very generous; the limit stops a giant file from an untrusted plugin_paths
@@ -151,8 +175,12 @@ class SkillLoader:
         allowed_tools_raw = _parse_allowed_tools(skill_md, data)
         metadata = _parse_metadata(skill_md, data)
 
+        declared_name: str = data["name"]
+        name = normalize_skill_name(declared_name)
+
         return SkillManifest(
-            name=data["name"],
+            name=name,
+            qualified_name=declared_name if declared_name != name else None,
             description=data["description"].strip(),
             skill_path=skill_dir,
             skill_md_path=skill_md,
@@ -273,11 +301,11 @@ def _validate(skill_md: Path, skill_dir: Path, data: dict[str, Any]) -> list[str
     name = data.get("name")
     if not name or not isinstance(name, str):
         raise SkillValidationError(skill_md, "name", "required string field")
-    if not _NAME_RE.match(name):
+    if not QUALIFIED_NAME_RE.match(name):
         raise SkillValidationError(
-            skill_md, "name", f"must match {_NAME_RE.pattern!r} (got {name!r})"
+            skill_md, "name", f"must match {QUALIFIED_NAME_RE.pattern!r} (got {name!r})"
         )
-    if name != skill_dir.name:
+    if normalize_skill_name(name) != skill_dir.name:
         warnings.append(f"name {name!r} does not match folder name {skill_dir.name!r}")
 
     description = data.get("description")

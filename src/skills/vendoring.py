@@ -56,3 +56,66 @@ def fallback_clone_command(repo_url: str, dest: Path | str) -> tuple[str, ...]:
 def submodule_sync_command() -> tuple[str, ...]:
     """Re-point submodules at what the currently checked-out ref pins."""
     return ("git", "submodule", "update", "--init", "--recursive")
+
+
+#: A marketplace may expose an aggregate directory of every skill alongside the
+#: per-bundle directories. In the RHDP Skills Marketplace that aggregate is
+#: ``skills/`` and each entry is a directory holding a single *symlink* to the
+#: canonical ``SKILL.md`` — no scripts, no references. Copying from it therefore
+#: reproduces exactly the failure this installer exists to prevent: a lone
+#: SKILL.md whose ``scripts/`` never arrives. Canonical roots are searched
+#: first and the aggregate is only a fallback for skills found nowhere else.
+AGGREGATE_ROOT_NAME = "skills"
+
+#: Directories never searched for skills: VCS metadata, build output, and the
+#: RCA bundle's ``experiments/``, which holds prompt variants that were never
+#: meant to ship.
+_SKIP_DIRS = frozenset({".git", ".github", ".claude-plugin", "experiments", "node_modules"})
+
+
+def discover_skill_roots(clone_dir: Path | str) -> list[Path]:
+    """Every directory-of-skill-directories in a cloned bundle.
+
+    Returns canonical per-bundle roots (``<bundle>/skills/``) first, then the
+    top-level aggregate (``skills/``) if present, so a caller that de-duplicates
+    by skill name keeps the copy that still has its scripts.
+
+    Only two levels are searched. Going deeper would sweep in vendored trees and
+    test fixtures, and every real bundle layout seen so far is one of these two.
+    """
+    base = Path(clone_dir)
+    canonical: list[Path] = []
+    aggregate: list[Path] = []
+
+    top = base / AGGREGATE_ROOT_NAME
+    if _holds_skills(top):
+        aggregate.append(top)
+
+    try:
+        children = sorted(p for p in base.iterdir() if p.is_dir())
+    except OSError:
+        return aggregate
+
+    for child in children:
+        if child.name.startswith(".") or child.name in _SKIP_DIRS:
+            continue
+        nested = child / AGGREGATE_ROOT_NAME
+        if _holds_skills(nested):
+            canonical.append(nested)
+
+    return canonical + aggregate
+
+
+def _holds_skills(root: Path) -> bool:
+    """True iff ``root`` directly contains at least one ``<dir>/SKILL.md``.
+
+    Name alone is not enough to identify a skill root: ``docs/skills/`` in the
+    RHDP marketplace holds Jekyll pages *about* skills, and a repo is free to
+    put anything under a directory called ``skills``.
+    """
+    if not root.is_dir():
+        return False
+    try:
+        return any((child / "SKILL.md").is_file() for child in root.iterdir() if child.is_dir())
+    except OSError:
+        return False

@@ -53,9 +53,11 @@ from src.skills.attachment import (
     state_path,
 )
 from src.skills.health import assess, build_tool_surface
+from src.skills.loader import QUALIFIED_NAME_RE, SkillSource
 from src.skills.sdk_root import sdk_skills_root
 from src.skills.vendoring import (
     clone_command,
+    discover_skill_roots,
     fallback_clone_command,
     submodule_sync_command,
 )
@@ -153,6 +155,10 @@ def _serialize(
 ) -> dict[str, Any]:
     return {
         "name": m.name,
+        # Present only for marketplace bundles, whose authors namespace the
+        # skill (``agnosticv:validator``). Operators searching upstream will
+        # look for this spelling, not the flattened one.
+        "qualified_name": m.qualified_name,
         "description": m.description,
         "source": m.source,
         "skill_path": str(m.skill_path),
@@ -174,6 +180,18 @@ def _serialize(
         "provenance": _read_provenance(m.skill_path),
         "removable": removable,
     }
+
+
+def _install_aliases(m: SkillManifest) -> set[str]:
+    """Every spelling by which an operator might name this skill in ``skills``.
+
+    A marketplace skill has up to three: the flattened name Parsec uses, the
+    namespaced name its author wrote, and the directory it sits in upstream.
+    """
+    names = {m.name, m.skill_path.name}
+    if m.qualified_name:
+        names.add(m.qualified_name)
+    return names
 
 
 def _read_provenance(skill_path: Path) -> dict[str, Any] | None:
@@ -411,7 +429,11 @@ async def install_skills(
 
     repo_url = str(payload.get("repo_url", "")).strip()
     ref = str(payload.get("ref", "")).strip()
-    subdir = str(payload.get("subdir", "skills")).strip().strip("/")
+    # Empty means "find every skill root in the clone". The old default of
+    # "skills" silently limited a marketplace install to whatever sat in the
+    # top-level aggregate directory — for rhpds/rhdp-skills-marketplace that is
+    # a set of bare SKILL.md symlinks, and it excludes the RCA bundle entirely.
+    subdir = str(payload.get("subdir", "")).strip().strip("/")
 
     raw_only = payload.get("skills")
     only: set[str] | None = None
@@ -419,7 +441,9 @@ async def install_skills(
         if not isinstance(raw_only, list):
             raise HTTPException(status_code=400, detail="'skills' must be a list of names")
         only = {str(x) for x in raw_only}
-        bad = sorted(n for n in only if not _SKILL_NAME_RE.match(n))
+        # Accept the namespaced spelling too: an operator copying a name out of
+        # the marketplace sees "showroom:create-lab", not "showroom-create-lab".
+        bad = sorted(n for n in only if not QUALIFIED_NAME_RE.match(n))
         if bad:
             raise HTTPException(status_code=400, detail=f"Invalid skill names: {', '.join(bad)}")
 
@@ -586,51 +610,71 @@ async def _clone_and_install(
         rc, sha_out, _ = await _run("git", "rev-parse", "HEAD", cwd=str(clone_dir))
         sha = sha_out.strip() if rc == 0 else "unknown"
 
-        source_root = clone_dir / subdir if subdir else clone_dir
-        if not source_root.is_dir():
-            raise HTTPException(status_code=400, detail=f"subdir {subdir!r} not found in repo")
+        if subdir:
+            source_roots = [clone_dir / subdir]
+            if not source_roots[0].is_dir():
+                raise HTTPException(status_code=400, detail=f"subdir {subdir!r} not found in repo")
+        else:
+            # A marketplace holds several bundles at once, and the RHDP one keeps
+            # its AIOps bundle behind a submodule. Discovery walks the clone so
+            # an operator pastes a URL rather than reverse-engineering a layout.
+            source_roots = discover_skill_roots(clone_dir)
+            if not source_roots:
+                raise HTTPException(
+                    status_code=400, detail="no directories of SKILL.md folders found in repo"
+                )
 
-        size = _dir_size(source_root)
+        size = sum(_dir_size(r) for r in source_roots)
         if size > INSTALL_MAX_BYTES:
             raise HTTPException(
                 status_code=413,
                 detail=f"bundle is {size} bytes, over the {INSTALL_MAX_BYTES} byte limit",
             )
 
+        # Load through the real loader rather than walking directories here: it
+        # applies the same validation and the same first-root-wins de-duplication
+        # that discovery will apply later, so what installs is exactly what would
+        # load. Order matters — `discover_skill_roots` puts canonical bundle
+        # roots ahead of an aggregate whose entries are SKILL.md symlinks with no
+        # scripts beside them.
+        manifests = SkillLoader([SkillSource("plugin", r) for r in source_roots]).load_all()
+
         root.mkdir(parents=True, exist_ok=True)
         installed: list[str] = []
-        for child in sorted(source_root.iterdir()):
-            if not child.is_dir() or child.is_symlink():
+        for m in manifests:
+            if not _SKILL_NAME_RE.match(m.name):
+                logger.warning("Skipping skill with unusable name: %r", m.name)
                 continue
-            if not (child / "SKILL.md").is_file():
-                continue
-            if not _SKILL_NAME_RE.match(child.name):
-                logger.warning("Skipping skill dir with unusable name: %s", child.name)
-                continue
-            if only is not None and child.name not in only:
+            if only is not None and not (_install_aliases(m) & only):
                 # Selective install. Pulling a whole repo drags in skills that
                 # cannot run here (ET's shell-based ones) and templates that
                 # were never meant to ship, and every one of them then needs
                 # explaining in the UI.
                 continue
-            dest = root / child.name
+            dest = root / m.name
             if dest.exists():
                 shutil.rmtree(dest, ignore_errors=True)
             shutil.copytree(
-                child, dest, symlinks=False, ignore=shutil.ignore_patterns("__pycache__", ".git")
+                m.skill_path,
+                dest,
+                symlinks=False,
+                ignore=shutil.ignore_patterns("__pycache__", ".git"),
             )
-            installed.append(child.name)
+            installed.append(m.name)
 
         if not installed:
+            where = repr(subdir) if subdir else "the repo"
             raise HTTPException(
-                status_code=400, detail=f"no SKILL.md directories found under {subdir!r}"
+                status_code=400, detail=f"no installable skills found under {where}"
             )
 
+        origin = {m.name: str(m.skill_path.relative_to(clone_dir)) for m in manifests}
         provenance = {
             "repo_url": repo_url,
             "ref": ref,
             "resolved_sha": sha,
             "subdir": subdir,
+            "skill_roots": sorted(str(p.relative_to(clone_dir)) for p in source_roots),
             "skills": installed,
             "requested": sorted(only) if only is not None else None,
         }
@@ -641,7 +685,12 @@ async def _clone_and_install(
         for name in installed:
             try:
                 (root / name / ".parsec-provenance.json").write_text(
-                    json.dumps({**provenance, "skill": name}, indent=2, sort_keys=True) + "\n",
+                    json.dumps(
+                        {**provenance, "skill": name, "source_path": origin.get(name)},
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
                     encoding="utf-8",
                 )
             except OSError:
