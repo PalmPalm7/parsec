@@ -653,6 +653,58 @@ async def test_ref_naming_a_file_is_not_checked_out_as_a_pathspec(tmp_path, loca
     assert not install_root.exists()
 
 
+@needs_git
+async def test_failed_reinstall_keeps_the_working_copy(tmp_path, local_git, monkeypatch):
+    """The old install is moved aside only once the new copy has fully landed."""
+    repo = _bundle_repo(tmp_path)
+    _commit(repo)
+    install_root = tmp_path / "installed"
+    await skills_routes._clone_and_install(str(repo), "main", "", install_root, None, HOSTS)
+    (install_root / "good-skill" / "marker").write_text("previous install\n")
+
+    def disk_full(src, dest):
+        Path(dest).mkdir(parents=True)
+        (Path(dest) / "partial").write_text("half")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(skills_routes, "copy_skill_tree", disk_full)
+
+    with pytest.raises(OSError):
+        await skills_routes._clone_and_install(str(repo), "main", "", install_root, None, HOSTS)
+
+    assert (install_root / "good-skill" / "marker").read_text() == "previous install\n"
+    assert list((install_root / ".staging").iterdir()) == []
+
+
+@needs_git
+async def test_reinstall_replaces_the_copy_and_leaves_nothing_behind(tmp_path, local_git):
+    repo = _bundle_repo(tmp_path)
+    _commit(repo)
+    install_root = tmp_path / "installed"
+    await skills_routes._clone_and_install(str(repo), "main", "", install_root, None, HOSTS)
+    (install_root / "good-skill" / "stale").write_text("from the previous install\n")
+
+    await skills_routes._clone_and_install(str(repo), "main", "", install_root, None, HOSTS)
+
+    assert not (install_root / "good-skill" / "stale").exists()
+    assert (install_root / "good-skill" / "SKILL.md").is_file()
+    assert list((install_root / ".staging").iterdir()) == []
+
+
+def test_a_staged_copy_is_never_discovered(tmp_path):
+    """A crash mid-install must not leave a half-copy that loads, or shadows the real one."""
+    install_root = tmp_path / "installed"
+    _skill_md(install_root / "good-skill", "good-skill")
+    _skill_md(install_root / ".staging" / "good-skill", "good-skill")
+    _skill_md(install_root / ".staging" / "good-skill.previous", "good-skill")
+
+    manifests = SkillLoader.from_config(
+        {"skills": {"project_root": "", "plugin_paths": [], "install_root": str(install_root)}}
+    ).load_all()
+
+    assert [m.skill_path for m in manifests] == [install_root / "good-skill"]
+
+
 # ------------------------------------------------ end to end: symlinks
 
 

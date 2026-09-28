@@ -688,6 +688,58 @@ async def _init_submodules(
         await _init_submodules(repo / rel, allowed_hosts, env, depth=depth + 1)
 
 
+#: Scratch space for an install, inside install_root so the final swap is a
+#: same-filesystem rename. The loader only looks for a SKILL.md in
+#: install_root's direct children and this directory never holds one itself,
+#: so a half-copied skill left by a crash can never be discovered — or shadow
+#: the installed copy, which a `.name.tmp` sibling would.
+_STAGING_DIRNAME = ".staging"
+
+
+def _replace_skill_dir(src: Path, dest: Path, staging_root: Path) -> list[str]:
+    """Install ``src`` at ``dest``, keeping the previous ``dest`` until the new one is in place.
+
+    Deleting ``dest`` before copying meant a failed copy — disk full, an
+    unreadable file — lost a skill that was working a moment earlier. The copy
+    now lands in staging first; ``dest`` is only moved aside once it has
+    succeeded, and is put back if the final rename fails. Returns the links
+    :func:`copy_skill_tree` skipped.
+    """
+    staging_root.mkdir(exist_ok=True)
+    staged = staging_root / dest.name
+    previous = staging_root / f"{dest.name}.previous"
+    for leftover in (staged, previous):
+        if leftover.exists():
+            shutil.rmtree(leftover)
+    try:
+        links = copy_skill_tree(src, staged)
+    except BaseException:
+        _rmtree_logged(staged)
+        raise
+    had_previous = dest.exists()
+    if had_previous:
+        dest.rename(previous)
+    try:
+        staged.rename(dest)
+    except BaseException:
+        if had_previous:
+            previous.rename(dest)
+        _rmtree_logged(staged)
+        raise
+    if had_previous:
+        _rmtree_logged(previous)
+    return links
+
+
+def _rmtree_logged(path: Path) -> None:
+    """Best-effort cleanup that says so when it fails, rather than hiding it."""
+    try:
+        if path.exists():
+            shutil.rmtree(path)
+    except OSError:
+        logger.warning("Could not remove %s after an install step", path, exc_info=True)
+
+
 def _symlink_reason(clone_dir: Path, m: SkillManifest) -> str | None:
     """Why this skill must not be installed because of a link, if it must not."""
     link = symlink_on_path(clone_dir, m.skill_path)
@@ -833,10 +885,7 @@ def _install_from_clone(
     installed: list[str] = []
     skipped_symlinks: dict[str, list[str]] = {}
     for m in selected:
-        dest = root / m.name
-        if dest.exists():
-            shutil.rmtree(dest, ignore_errors=True)
-        links = copy_skill_tree(m.skill_path, dest)
+        links = _replace_skill_dir(m.skill_path, root / m.name, root / _STAGING_DIRNAME)
         if links:
             logger.warning("Installed %s without its symlinks: %s", m.name, links)
             skipped_symlinks[m.name] = links
