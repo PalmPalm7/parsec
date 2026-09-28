@@ -99,9 +99,10 @@ def attachment_snapshot(config: Any = None) -> dict[str, Any]:
     (agent -> skills) should use
     :func:`src.skills.attachment.skills_by_agent`.
 
-    Falls back to an empty mapping on any failure: ``skills_for`` then reverts
-    to the static map, so a malformed override file degrades attachment to the
-    pre-existing behaviour rather than removing every skill from every agent.
+    Raises on failure; :func:`skills_for` catches that and falls back to the
+    static ``_AGENT_SKILLS`` map, so a failure here degrades attachment to the
+    pre-existing behaviour rather than removing every skill from every agent. (A
+    malformed override file never gets that far: ``load_state`` ignores it.)
     """
     from src.agent.agents import AGENTS
     from src.skills.attachment import load_state, resolve, state_path
@@ -122,7 +123,7 @@ def attachment_snapshot(config: Any = None) -> dict[str, Any]:
     )
 
 
-def skills_for(agent_type: str) -> list[str]:
+def skills_for(agent_type: str, config: Any = None) -> list[str]:
     """Skills to preload for ``agent_type``, filtered to those actually shipped.
 
     A name that is not on disk would be silently ignored by the SDK, so it is
@@ -134,11 +135,25 @@ def skills_for(agent_type: str) -> list[str]:
     well-formed skill no longer requires editing this file. If that resolution
     fails for any reason we fall back to the static map, which is the behaviour
     that shipped before overrides existed.
+
+    Both halves — attachment (skill roots, ``skills.state_path``) and the
+    on-disk filter (``agent.sdk.cwd``) — read ``config``, defaulting to the live
+    one. Resolving either against global state or ``Path.cwd()`` while the
+    caller runs under another config is the startup-vs-reload split that
+    :func:`~src.skills.sdk_root.sdk_cwd` closed: the profile would filter
+    against a root the skills were never published into and drop all of them.
     """
+    from src.skills.sdk_root import sdk_cwd
+
+    if config is None:
+        from src.config import get_config
+
+        config = get_config()
+
     try:
         from src.skills.attachment import skills_by_agent
 
-        wanted = skills_by_agent(attachment_snapshot()).get(agent_type, ())
+        wanted = skills_by_agent(attachment_snapshot(config)).get(agent_type, ())
     except Exception:
         logger.exception(
             "Attachment resolution failed for agent %s; falling back to the static map",
@@ -148,7 +163,7 @@ def skills_for(agent_type: str) -> list[str]:
 
     if not wanted:
         return []
-    available = discoverable_skill_names()
+    available = discoverable_skill_names(sdk_cwd(config))
     if not available:
         # Discovery unavailable (e.g. unit tests with no skills root): trust the
         # map rather than silently dropping everything.
@@ -168,9 +183,10 @@ def skills_for(agent_type: str) -> list[str]:
 def discoverable_skill_names(cwd: str | None = None) -> frozenset[str]:
     """Names the SDK can actually load, i.e. what is under its discovery root.
 
-    ``cwd`` must match ``agent.sdk.cwd`` when that is set; the other two callers
-    of ``sdk_skills_root`` already pass it, and this defaulting to ``Path.cwd()``
-    silently dropped every mounted skill whenever the two diverged.
+    ``cwd`` must match ``agent.sdk.cwd`` when that is set — pass
+    ``sdk_cwd(config)``; the other callers of ``sdk_skills_root`` already do,
+    and this defaulting to ``Path.cwd()`` silently dropped every mounted skill
+    whenever the two diverged.
     """
     try:
         from src.skills.sdk_root import sdk_skills_root
@@ -248,7 +264,7 @@ def sdk_profile_for(agent_type: str, config: Any) -> dict[str, Any]:
         "max_turns": agent_cfg.max_rounds + TURN_HEADROOM,
     }
 
-    skills = skills_for(agent_type)
+    skills = skills_for(agent_type, config)
     if skills:
         profile["skills"] = skills
 

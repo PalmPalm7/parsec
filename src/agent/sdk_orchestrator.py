@@ -148,7 +148,7 @@ def _agent_definitions(config: Any) -> dict[str, Any]:
             "tools": tool_names_for(list(agent_cfg.tools)),
             "maxTurns": agent_cfg.max_rounds + TURN_HEADROOM,
         }
-        skills = skills_for(agent_type)
+        skills = skills_for(agent_type, config)
         if skills:
             kwargs["skills"] = skills
         definitions[agent_type] = AgentDefinition(**kwargs)
@@ -375,7 +375,12 @@ async def run_agent_via_sdk(
     collector.record_runtime("sdk")
     collector.record_agent_dispatch("orchestrator", routing_method="sdk")
 
-    translator = SdkEventTranslator(question=question, history=conversation_history or [])
+    # The translator re-resolves preloaded and invoked skills for the UI badges;
+    # it must read the same config the AgentDefinitions below are built from, or
+    # the badges describe a different skill set from the one the agents got.
+    translator = SdkEventTranslator(
+        question=question, history=conversation_history or [], config=cfg
+    )
 
     try:
         options = build_orchestrator_options(cfg, system=_orchestrator_system(cfg))
