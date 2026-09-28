@@ -93,7 +93,7 @@ The six dimensions below each zoom into one part of this picture.
 
 - A skill is a folder with a `SKILL.md` = YAML frontmatter (`name`, `description`, `allowed-tools`, a Parsec `parsec:` block) + a Markdown workflow body. Canonical example: `skills/icinga-triage/SKILL.md` *( #32/#34 )*.
 - **Two discovery planes that share a directory but not a code path** (conflating them is the #1 newcomer mistake):
-  - **`SkillLoader`** (`src/skills/loader.py`, #23) reads `skills.project_root` / `plugin_paths` / `user_root`. It backs `GET /api/skills` and the Skills tab, and validates in CI. It never executes anything.
+  - **`SkillLoader`** (`src/skills/loader.py`, #23) reads `skills.project_root` / `plugin_paths` / `install_root` / `user_root`. It backs `GET /api/skills` and the Skills tab, and validates in CI. It never executes anything.
   - **The Agent SDK** discovers skills **only** under `<cwd>/.claude/skills/`, because `agent.sdk.setting_sources` is `["project"]`.
 - **`sync_sdk_skill_root()`** (`src/skills/sdk_root.py`, called from `src/app.py`) bridges them at startup by symlinking every discovered skill into the SDK's root. So **anything the loader discovers becomes SDK-executable** — there is no "listed but safe" state. The Dockerfile seeds that root as a real directory of per-skill symlinks (not one symlink to `skills/`), so baked and mounted skills coexist as siblings.
 - **Activation** is resolved per request, not hardcoded: operator override → the skill's own `parsec.domain` → the `_AGENT_SKILLS` supplement, unioned (`src/skills/attachment.py`). `skills_for(agent_type)` feeds `AgentDefinition.skills`. A well-formed mounted skill therefore attaches with **no code change**.
@@ -348,7 +348,7 @@ that was architectural. `discoverable_skill_names()` reads the filesystem on eve
 
 | | Stage | Runs |
 |---|---|---|
-| 1 | Source roots on disk (`project_root`, `plugin_paths`) | whenever bytes land |
+| 1 | Source roots on disk (`project_root`, `plugin_paths`, `install_root`) | whenever bytes land |
 | 2 | `SkillLoader` discovery + dedup (`project_root` wins) | every call |
 | 3 | `sync_sdk_skill_root()` → `<cwd>/.claude/skills/` | **startup, or `POST /api/skills/reload`** |
 | 4 | Attachment: override → `parsec.domain` → supplement | every request |
@@ -358,7 +358,10 @@ that was architectural. `discoverable_skill_names()` reads the filesystem on eve
 "will this work". `GET /api/skills` now returns a verdict per skill:
 
 - `unusable` — requests withheld built-ins (Bash/Read/Write), **or** references files it did not
-  ship, **or** its procedure assumes a shell.
+  ship, **or** its procedure assumes a shell. A reference means that exact path: `scripts/cli.py`
+  is missing even when `scripts/` exists (there used to be a parent-directory fallback that let an
+  incomplete bundle report `ok`). A glob or placeholder reference (`scripts/fetch-*.sh`) needs at
+  least one file matching its literal stem.
 - `orphaned` — attached to no agent, so nothing can activate it.
 - `ok` — plus `notes` for non-blocking observations.
 
@@ -374,18 +377,43 @@ It parsed cleanly, reported `sdk_visible: true`, carried no warnings, and was in
 mounted — verified on the cluster: a freshly installed copy at `ea43c5c1` lost to it. The stub is
 deleted; `aap2-job-failure-rca` carries the same method against bridged tools.
 
-**Endpoints** (all admin-gated via the same `X-Forwarded-Email` path as `/api/learnings`):
+**Endpoints.** `GET /api/skills` passes the same allowed-user check as `/api/query` (it returns
+filesystem paths, `plugin_paths` and install provenance). Every write below is also admin-gated via
+the same `X-Forwarded-Email` path as `/api/learnings`:
 
 - `POST /api/skills/reload` — re-runs discovery and republishes the SDK root. No pod restart.
 - `PUT|DELETE /api/skills/{name}/attachment` — move a skill between agents, or switch it off.
+  Overrides live in `skills.state_path`; writes are serialized across replicas by an `flock` on a
+  sidecar `<state>.lock` (bounded wait, run off the event loop), so two operators editing at once
+  cannot silently lose one change.
 - `POST /api/skills/install` — clone a bundle at a pinned ref. **Off by default**
-  (`skills.install_enabled`), host-allowlisted, size-capped, symlinks stripped on copy, accepts a
-  `skills: [...]` filter, and records the resolved SHA inside each installed skill.
+  (`skills.install_enabled`), accepts a `skills: [...]` filter, and records the resolved SHA inside
+  each installed skill. What it will and will not do:
+  - **Hosts.** `repo_url` *and every submodule* must be HTTPS to a host in `skills.install_hosts`.
+    The clone never recurses; `git submodule init` resolves each URL (relative ones included) with
+    no network, every resolved URL is checked, and one bad entry refuses the whole install before
+    anything is fetched. Every git process runs with `GIT_ALLOW_PROTOCOL=https` and no system or
+    global git config, so git itself refuses `file`/`ssh`/`ext` even if that check were bypassed.
+    Each submodule fetch's exit code is checked — a failure aborts rather than leaving an empty
+    bundle behind a recorded SHA — and so is a gitlink that `.gitmodules` does not map, anywhere in
+    the repo: it could never be fetched, so the install is refused rather than shipped half-empty.
+  - **Symlinks are never copied**, at any depth — not dereferenced, not materialised. A skill whose
+    directory or `SKILL.md` is a link is not installed (the marketplace's aggregate `skills/` stubs);
+    a link inside an installed skill is left out. Both are reported (`skipped_skills`,
+    `skipped_symlinks`, and in each skill's `.parsec-provenance.json`).
+  - **Size cap** (64 MiB) is measured over exactly the regular files that will be written, before
+    anything is written.
 - `DELETE /api/skills/{name}` — remove an installed skill. Refuses anything outside
   `skills.install_root`, so in-repo skills can only be removed by a PR.
 
 **Config** (`config/config.yaml`, all settable as `PARSEC_SKILLS__*` deploy vars):
-`state_path`, `install_root`, `install_enabled`, `install_hosts`.
+`state_path`, `install_root`, `install_enabled`, `install_hosts`. `install_root` is searched as a
+plugin root automatically — it no longer has to be listed in `plugin_paths` too.
+
+**SDK root and attachment follow the active config.** `skills_for()`, the orchestrator's
+`AgentDefinition`s and the stream translator's skill badges all resolve against the config the turn
+runs under — `agent.sdk.cwd` via `sdk_cwd()`, `skills.state_path` for overrides — never `Path.cwd()`
+or a default config. (Same class of bug as startup vs reload publishing into different roots.)
 
 **Gotcha worth knowing.** Dynaconf materialises env-supplied settings with **UPPERCASE** keys when
 `config.yaml` does not already declare them, so a deployed pod's skills section is genuinely
@@ -395,4 +423,11 @@ deploy-var override.
 
 **Limits.** Adding a new `plugin_paths` *root* is still a pod-template change (restart). Hot install
 removes PR review as the gate, which is why it is off by default and provenance-recording; the
-production recommendation remains a digest-pinned bundle, not a free-text URL.
+production recommendation remains a digest-pinned bundle, not a free-text URL. Persistence depends
+on where `install_root` and `state_path` point: in `playbooks/templates/manifests.yaml.j2`
+`/app/data` is the RWX `parsec-pricing-cache` PVC, shared by every replica (hence the lock), but the
+`parsec-skills` test deployment used an `emptyDir`, where both vanish on restart.
+
+**Image runtime contract.** The Dockerfile's verify step asserts `git`, a writable `$HOME`, Node,
+that the `claude` on `PATH` is the pinned `CLAUDE_CODE_VERSION`, and the seeded `/app/.claude/skills`. Rebasing onto another base image (the
+ubi9-minimal work in #29) must keep all of them, or the image build fails.
