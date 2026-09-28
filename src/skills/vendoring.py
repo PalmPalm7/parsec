@@ -216,7 +216,7 @@ def submodule_url_problem(url: str | None, allowed_hosts: Iterable[str]) -> str 
         parts = urlsplit(url)
         port = parts.port
     except ValueError as e:
-        return f"unparseable URL ({e})"
+        return f"unparsable URL ({e})"
     if parts.scheme.lower() != "https":
         return f"scheme {parts.scheme or '(none)'!r} is not https"
     if "@" in parts.netloc:

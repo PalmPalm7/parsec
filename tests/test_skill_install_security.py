@@ -298,7 +298,7 @@ def test_submodule_url_accepted(url):
         ("https://user:pw@github.com/x.git", "credentials"),
         ("https://github.com@evil.example/x.git", "credentials"),
         ("https://github.com:8443/x.git", "port"),
-        ("https://github.com:99999/x.git", "unparseable"),
+        ("https://github.com:99999/x.git", "unparsable"),
         ("", "no URL"),
         (None, "no URL"),
     ],
