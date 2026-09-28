@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -82,6 +83,11 @@ class SkillLoader:
         Reads ``skills.project_root``, ``skills.plugin_paths``, and
         ``skills.user_root`` with sensible defaults. Empty/missing values
         skip the corresponding source.
+
+        ``skills.install_root`` is searched as one more plugin root, after
+        ``plugin_paths``, unless it is already listed there. Requiring operators
+        to list it twice meant an install could succeed, write every file, and
+        still leave the skills undiscoverable.
         """
         skills_cfg = _get_skills_section(config)
 
@@ -94,6 +100,10 @@ class SkillLoader:
         plugin_paths = skills_cfg.get("plugin_paths", []) or []
         for p in plugin_paths:
             sources.append(SkillSource(label="plugin", root=Path(p)))
+
+        install_root = skills_cfg.get("install_root", "")
+        if install_root and _norm(install_root) not in {_norm(p) for p in plugin_paths}:
+            sources.append(SkillSource(label="plugin", root=Path(install_root)))
 
         user_root = skills_cfg.get("user_root", "")
         if user_root:
@@ -212,6 +222,11 @@ class SkillLoader:
                 continue
             seen[m.name] = m
         return list(seen.values())
+
+
+def _norm(p: Any) -> str:
+    """A path spelling for equality only: ``/a/b/``, ``/a/./b`` and ``/a/b`` match."""
+    return os.path.normpath(os.path.abspath(os.path.expanduser(str(p))))
 
 
 def _read_skill_file(skill_md: Path) -> str:

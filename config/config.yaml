@@ -217,7 +217,9 @@ skills:
   # It vendors each bundle as a git SUBMODULE (the AIOps/RCA bundle is
   # rhdp-rca-plugin), so clone it with --recurse-submodules or the bundle
   # directory arrives empty and discovery silently finds nothing. The installer
-  # (POST /api/skills/install) already passes those flags.
+  # (POST /api/skills/install) fetches submodules itself, but only after every
+  # submodule URL passes the same check as repo_url (HTTPS, install_hosts, no
+  # credentials); one bad .gitmodules entry refuses the whole install.
   #
   #   plugin_paths:
   #     - "/opt/rhdp-skills-marketplace/rhdp-rca-plugin/skills"
@@ -241,8 +243,9 @@ skills:
   # Where operator attachment overrides (set from the Skills tab) are persisted.
   # Must be on a writable path; data/ already is.
   state_path: "data/skills_state.json"
-  # Writable root that POST /api/skills/install copies bundles into. Add it to
-  # plugin_paths as well, or installed skills are fetched and never discovered.
+  # Writable root that POST /api/skills/install copies bundles into. It is
+  # searched automatically as a plugin root (after plugin_paths, before
+  # user_root); listing it in plugin_paths as well is harmless, not required.
   install_root: ""
   # Install is OFF by default. A SKILL.md is instruction text steering an agent
   # that holds live credentials, so pulling one at runtime is a deliberate

@@ -22,7 +22,8 @@ change, a PR and an image rebuild:
 The install endpoint is the sharp one: it pulls third-party instruction text
 into a pod holding live credentials, and a SKILL.md steers a credentialed agent.
 It is therefore admin-gated, **disabled by default**, restricted to an
-allowlisted set of hosts, and it records provenance for everything it writes.
+allowlisted set of hosts — for every submodule as well as the top-level repo —
+never copies a symlink, and records provenance for everything it writes.
 Turning it on is a deliberate decision, not a default.
 """
 
@@ -34,10 +35,13 @@ import logging
 import re
 import shutil
 import tempfile
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Header, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from src.agent.learnings import is_admin_user_async
 from src.config import get_config
@@ -56,10 +60,23 @@ from src.skills.health import assess, build_tool_surface
 from src.skills.loader import QUALIFIED_NAME_RE, SkillSource
 from src.skills.sdk_root import sdk_cwd, sdk_skills_root
 from src.skills.vendoring import (
+    MAX_SUBMODULE_DEPTH,
+    checkout_command,
     clone_command,
+    copy_skill_tree,
     discover_skill_roots,
     fallback_clone_command,
-    submodule_sync_command,
+    git_env,
+    gitmodules_paths_command,
+    parse_config_z,
+    submodule_config_command,
+    submodule_init_command,
+    submodule_problems,
+    submodule_settings,
+    submodule_unshallow_command,
+    submodule_update_command,
+    symlink_on_path,
+    tree_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -221,6 +238,9 @@ async def list_skills(
     """Every discoverable skill, with health and attachment."""
     cfg = get_config()
     user = x_forwarded_email or x_forwarded_user
+    # Same gate as the mutating routes: the response carries filesystem paths,
+    # plugin_paths, install provenance and whether install is enabled.
+    await _check_user_allowed(request, user)
 
     try:
         manifests, attachments = _collect(cfg)
@@ -238,7 +258,7 @@ async def list_skills(
     section_cfg = _skills_section(cfg)
     install_root = section_cfg.get("install_root")
     out: list[dict[str, Any]] = []
-    counts = {"ok": 0, "degraded": 0, "orphaned": 0, "unusable": 0}
+    counts = {"ok": 0, "orphaned": 0, "unusable": 0}
 
     for m in manifests:
         att = attachments.get(m.name, Attachment(skill=m.name, agents=(), origin="none"))
@@ -254,7 +274,6 @@ async def list_skills(
             )
         )
 
-    section_cfg = _skills_section(cfg)
     return {
         "count": len(out),
         "sdk_visible_count": sum(1 for s in out if s["sdk_visible"]),
@@ -351,8 +370,15 @@ async def set_attachment(
     enabled = bool(payload.get("enabled", True))
     cfg = get_config()
     try:
-        save_override(
-            state_path(cfg), skill=name, agents=agents, enabled=enabled, actor=user or "unknown"
+        # In a worker thread: the write waits on a cross-replica lock, and a
+        # peer holding it must not stall this replica's chat streams and probes.
+        await run_in_threadpool(
+            save_override,
+            state_path(cfg),
+            skill=name,
+            agents=agents,
+            enabled=enabled,
+            actor=user or "unknown",
         )
     except OSError as e:
         logger.exception("Could not persist attachment for %s", name)
@@ -379,7 +405,7 @@ async def reset_attachment(
 
     cfg = get_config()
     try:
-        removed = clear_override(state_path(cfg), skill=name)
+        removed = await run_in_threadpool(clear_override, state_path(cfg), skill=name)
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"Could not persist: {e}") from e
 
@@ -403,7 +429,9 @@ async def install_skills(
     "subdir": "skills"}``.
 
     Guards, in order: feature flag, admin, host allowlist, shape validation,
-    bounded clone, size cap, then a write confined to the configured install
+    bounded clone under a hermetic HTTPS-only git, every submodule URL held to
+    the same allowlist before any is fetched, a size cap over exactly what will
+    be written, then a symlink-free copy confined to the configured install
     root. The resolved commit SHA is recorded next to the installed bundle so a
     later reader can tell exactly what was pulled and when.
     """
@@ -466,7 +494,7 @@ async def install_skills(
         )
 
     try:
-        installed, sha = await _clone_and_install(repo_url, ref, subdir, root, only)
+        result = await _clone_and_install(repo_url, ref, subdir, root, only, allowed_hosts)
     except HTTPException:
         raise
     except Exception as e:
@@ -482,13 +510,20 @@ async def install_skills(
         published = {}
 
     logger.info(
-        "Installed %d skills from %s@%s (%s) by %s", len(installed), repo_url, ref, sha[:8], user
+        "Installed %d skills from %s@%s (%s) by %s",
+        len(result.installed),
+        repo_url,
+        ref,
+        result.sha[:8],
+        user,
     )
     return {
-        "installed": installed,
+        "installed": result.installed,
         "repo_url": repo_url,
         "ref": ref,
-        "resolved_sha": sha,
+        "resolved_sha": result.sha,
+        "skipped_symlinks": result.skipped_symlinks,
+        "skipped_skills": result.skipped_skills,
         "published": sorted(published),
         "hint": "Newly installed skills are attached by parsec.domain; set attachment explicitly if they declare none.",
     }
@@ -535,7 +570,7 @@ async def uninstall_skill(
             detail=f"{name!r} is not an installed skill (in-repo skills are removed by a PR, not here)",
         )
 
-    shutil.rmtree(target)
+    await run_in_threadpool(shutil.rmtree, target)
 
     # Republish so the SDK root loses its symlink on the same request.
     try:
@@ -549,11 +584,18 @@ async def uninstall_skill(
     return {"uninstalled": name, "remaining": len(published), "published": sorted(published)}
 
 
-async def _run(*args: str, cwd: str | None = None) -> tuple[int, str, str]:
-    """Run a command with a hard timeout, returning (rc, stdout, stderr)."""
+async def _run(
+    *args: str, cwd: str | None = None, env: Mapping[str, str] | None = None
+) -> tuple[int, str, str]:
+    """Run a git command with a hard timeout, returning (rc, stdout, stderr).
+
+    Always under the hermetic :func:`git_env` unless the caller hands one in, so
+    a new call site cannot forget it.
+    """
     proc = await asyncio.create_subprocess_exec(
         *args,
         cwd=cwd,
+        env=dict(env) if env is not None else git_env(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -566,131 +608,271 @@ async def _run(*args: str, cwd: str | None = None) -> tuple[int, str, str]:
     return proc.returncode or 0, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
-def _dir_size(path: Path) -> int:
-    total = 0
-    for p in path.rglob("*"):
-        try:
-            if p.is_file() and not p.is_symlink():
-                total += p.stat().st_size
-        except OSError:
-            continue
-    return total
+@dataclass
+class _InstallResult:
+    """What one install wrote, and what it deliberately left behind."""
+
+    installed: list[str]
+    sha: str
+    #: Installed skill -> relative paths inside it that were links, not copied.
+    skipped_symlinks: dict[str, list[str]] = field(default_factory=dict)
+    #: Skills not installed at all: ``{"skill", "source_path", "reason"}``.
+    skipped_skills: list[dict[str, str]] = field(default_factory=list)
+
+
+async def _init_submodules(
+    repo: Path, allowed_hosts: tuple[str, ...], env: Mapping[str, str], *, depth: int = 0
+) -> None:
+    """Fetch ``repo``'s submodules — only after every one passes the allowlist.
+
+    ``git submodule init`` resolves each URL (a relative one against this
+    repo's own origin) without touching the network. Every resolved URL is then
+    held to the ``repo_url`` rule, and one failure refuses the lot before
+    anything is fetched. Every fetch's exit code is checked: an ignored failure
+    used to leave an empty bundle directory behind a recorded ``resolved_sha``.
+    Recurses into each submodule's own ``.gitmodules``, to
+    :data:`MAX_SUBMODULE_DEPTH` levels.
+    """
+    cwd = str(repo)
+
+    # Run even when there is no .gitmodules: init is a no-op (rc 0) on a repo
+    # without gitlinks, and fails on a gitlink that .gitmodules does not map —
+    # which would otherwise install "successfully" with that directory empty.
+    rc, _, err = await _run(*submodule_init_command(), cwd=cwd, env=env)
+    if rc != 0:
+        raise HTTPException(status_code=400, detail=f"git submodule init failed: {err.strip()}")
+
+    # Exit code 1 means no matching keys: nothing to fetch at this level.
+    rc, out, err = await _run(*submodule_config_command(), cwd=cwd, env=env)
+    if rc not in (0, 1):
+        raise HTTPException(
+            status_code=400, detail=f"could not read submodule config: {err.strip()}"
+        )
+    settings = submodule_settings(parse_config_z(out))
+    if not settings:
+        return
+    if depth >= MAX_SUBMODULE_DEPTH:
+        raise HTTPException(
+            status_code=400, detail=f"submodules nest deeper than {MAX_SUBMODULE_DEPTH} levels"
+        )
+
+    problems = submodule_problems(settings, allowed_hosts)
+    if problems:
+        detail = "; ".join(f"submodule {name!r}: {reason}" for name, reason in problems)
+        raise HTTPException(status_code=400, detail=f"refusing to fetch submodules: {detail}")
+
+    rc, out, _ = await _run(*gitmodules_paths_command(), cwd=cwd, env=env)
+    declared = submodule_settings(parse_config_z(out)) if rc == 0 else {}
+    for name in sorted(settings):
+        path = declared.get(name, {}).get("path") or ""
+        rel = Path(path)
+        if not path or rel.is_absolute() or ".." in rel.parts or symlink_on_path(repo, repo / rel):
+            raise HTTPException(
+                status_code=400, detail=f"submodule {name!r} has an unusable path {path!r}"
+            )
+        rc, _, err = await _run(*submodule_update_command(path), cwd=cwd, env=env)
+        if rc != 0:
+            # Not every server serves a shallow fetch of a commit that is not a
+            # branch tip; retry the same, already-validated URL in full. The
+            # retry reuses whatever the shallow attempt cloned, so deepen that
+            # first or it asks for the same commit and is refused the same way.
+            if (repo / rel / ".git").exists():
+                await _run(*submodule_unshallow_command(), cwd=str(repo / rel), env=env)
+            rc, _, err = await _run(
+                *submodule_update_command(path, shallow=False), cwd=cwd, env=env
+            )
+        if rc != 0:
+            raise HTTPException(
+                status_code=400, detail=f"git submodule update failed for {name!r}: {err.strip()}"
+            )
+        await _init_submodules(repo / rel, allowed_hosts, env, depth=depth + 1)
+
+
+def _symlink_reason(clone_dir: Path, m: SkillManifest) -> str | None:
+    """Why this skill must not be installed because of a link, if it must not."""
+    link = symlink_on_path(clone_dir, m.skill_path)
+    if link is not None:
+        return f"reached through a symlink ({link.relative_to(clone_dir).as_posix()})"
+    if (m.skill_path / "SKILL.md").is_symlink():
+        # The marketplace's aggregate-stub shape: the real skill, scripts and
+        # all, lives wherever the link points, and is installed from there.
+        return "SKILL.md is a symlink"
+    return None
 
 
 async def _clone_and_install(
-    repo_url: str, ref: str, subdir: str, root: Path, only: set[str] | None = None
-) -> tuple[list[str], str]:
-    """Clone at ``ref``, copy each skill directory into ``root``, record provenance.
+    repo_url: str,
+    ref: str,
+    subdir: str,
+    root: Path,
+    only: set[str] | None = None,
+    allowed_hosts: tuple[str, ...] = DEFAULT_INSTALL_HOSTS,
+) -> _InstallResult:
+    """Clone at ``ref``, copy each selected skill into ``root``, record provenance.
 
-    ``--depth 1`` against an explicit ref keeps the fetch small. The tree is
-    copied with symlinks skipped, so a bundle cannot smuggle a link that escapes
-    the install root once it is published into the SDK's discovery directory.
+    ``--depth 1`` against an explicit ref keeps the fetch small. Submodules are
+    fetched only once :func:`_init_submodules` has held every URL to
+    ``allowed_hosts``. No symlink is ever copied: a skill whose directory or
+    ``SKILL.md`` is a link is not installed at all, and a link anywhere inside
+    an installed skill is left behind and reported in ``skipped_symlinks`` — so
+    a bundle cannot smuggle a host file into the SDK's discovery directory.
+    Nothing is written under ``root`` until the size cap has passed.
     """
+    env = git_env()
     with tempfile.TemporaryDirectory(prefix="skill-install-") as tmp:
         clone_dir = Path(tmp) / "repo"
-        rc, _, err = await _run(*clone_command(repo_url, ref, clone_dir))
+        rc, _, err = await _run(*clone_command(repo_url, ref, clone_dir), env=env)
         if rc != 0:
-            # A SHA cannot be used with --branch; fall back to a full clone +
-            # checkout, then re-sync submodules against what that ref pins.
-            rc2, _, err2 = await _run(*fallback_clone_command(repo_url, clone_dir))
+            # A SHA cannot be used with --branch; fall back to a full clone plus
+            # checkout, starting from nothing so a partial first attempt cannot
+            # leave the second one cloning into a non-empty directory.
+            shutil.rmtree(clone_dir, ignore_errors=True)
+            rc2, _, err2 = await _run(*fallback_clone_command(repo_url, clone_dir), env=env)
             if rc2 != 0:
                 raise HTTPException(
                     status_code=400, detail=f"git clone failed: {err.strip() or err2.strip()}"
                 )
-            rc3, _, err3 = await _run("git", "checkout", ref, cwd=str(clone_dir))
+            rc3, _, err3 = await _run(*checkout_command(ref), cwd=str(clone_dir), env=env)
             if rc3 != 0:
                 raise HTTPException(
                     status_code=400, detail=f"git checkout {ref} failed: {err3.strip()}"
                 )
-            await _run(*submodule_sync_command(), cwd=str(clone_dir))
 
-        rc, sha_out, _ = await _run("git", "rev-parse", "HEAD", cwd=str(clone_dir))
+        # Both paths arrive here with HEAD at `ref` and no submodule fetched.
+        await _init_submodules(clone_dir, allowed_hosts, env)
+
+        rc, sha_out, _ = await _run("git", "rev-parse", "HEAD", cwd=str(clone_dir), env=env)
         sha = sha_out.strip() if rc == 0 else "unknown"
 
-        if subdir:
-            source_roots = [clone_dir / subdir]
-            if not source_roots[0].is_dir():
-                raise HTTPException(status_code=400, detail=f"subdir {subdir!r} not found in repo")
-        else:
-            # A marketplace holds several bundles at once, and the RHDP one keeps
-            # its AIOps bundle behind a submodule. Discovery walks the clone so
-            # an operator pastes a URL rather than reverse-engineering a layout.
-            source_roots = discover_skill_roots(clone_dir)
-            if not source_roots:
-                raise HTTPException(
-                    status_code=400, detail="no directories of SKILL.md folders found in repo"
-                )
+        # Everything from here on is blocking filesystem work — discovery, the
+        # size walk, up to INSTALL_MAX_BYTES of copying — so it runs in a worker
+        # thread rather than stalling every chat stream on this replica.
+        return await run_in_threadpool(
+            _install_from_clone, clone_dir, repo_url, ref, subdir, root, only, sha
+        )
 
-        size = sum(_dir_size(r) for r in source_roots)
-        if size > INSTALL_MAX_BYTES:
+
+def _install_from_clone(
+    clone_dir: Path,
+    repo_url: str,
+    ref: str,
+    subdir: str,
+    root: Path,
+    only: set[str] | None,
+    sha: str,
+) -> _InstallResult:
+    """Select, size-check, copy and record provenance for a fetched clone."""
+    if subdir:
+        source_root = clone_dir / subdir
+        if symlink_on_path(clone_dir, source_root) is not None:
+            raise HTTPException(status_code=400, detail=f"subdir {subdir!r} is a symlink")
+        if not source_root.is_dir():
+            raise HTTPException(status_code=400, detail=f"subdir {subdir!r} not found in repo")
+        source_roots = [source_root]
+    else:
+        # A marketplace holds several bundles at once, and the RHDP one keeps
+        # its AIOps bundle behind a submodule. Discovery walks the clone so
+        # an operator pastes a URL rather than reverse-engineering a layout.
+        source_roots = discover_skill_roots(clone_dir)
+        if not source_roots:
             raise HTTPException(
-                status_code=413,
-                detail=f"bundle is {size} bytes, over the {INSTALL_MAX_BYTES} byte limit",
+                status_code=400, detail="no directories of SKILL.md folders found in repo"
             )
 
-        # Load through the real loader rather than walking directories here: it
-        # applies the same validation and the same first-root-wins de-duplication
-        # that discovery will apply later, so what installs is exactly what would
-        # load. Order matters — `discover_skill_roots` puts canonical bundle
-        # roots ahead of an aggregate whose entries are SKILL.md symlinks with no
-        # scripts beside them.
-        manifests = SkillLoader([SkillSource("plugin", r) for r in source_roots]).load_all()
+    # Load through the real loader rather than walking directories here: it
+    # applies the same validation and the same first-root-wins de-duplication
+    # that discovery will apply later, so what installs is exactly what would
+    # load. Order matters — `discover_skill_roots` puts canonical bundle
+    # roots ahead of an aggregate whose entries are SKILL.md symlinks with no
+    # scripts beside them.
+    manifests = SkillLoader([SkillSource("plugin", r) for r in source_roots]).load_all()
 
-        root.mkdir(parents=True, exist_ok=True)
-        installed: list[str] = []
-        for m in manifests:
-            if not _SKILL_NAME_RE.match(m.name):
-                logger.warning("Skipping skill with unusable name: %r", m.name)
-                continue
-            if only is not None and not (_install_aliases(m) & only):
-                # Selective install. Pulling a whole repo drags in skills that
-                # cannot run here (ET's shell-based ones) and templates that
-                # were never meant to ship, and every one of them then needs
-                # explaining in the UI.
-                continue
-            dest = root / m.name
-            if dest.exists():
-                shutil.rmtree(dest, ignore_errors=True)
-            shutil.copytree(
-                m.skill_path,
-                dest,
-                symlinks=False,
-                ignore=shutil.ignore_patterns("__pycache__", ".git"),
+    selected: list[SkillManifest] = []
+    skipped_skills: list[dict[str, str]] = []
+    for m in manifests:
+        if not _SKILL_NAME_RE.match(m.name):
+            logger.warning("Skipping skill with unusable name: %r", m.name)
+            continue
+        if only is not None and not (_install_aliases(m) & only):
+            # Selective install. Pulling a whole repo drags in skills that
+            # cannot run here (ET's shell-based ones) and templates that
+            # were never meant to ship, and every one of them then needs
+            # explaining in the UI.
+            continue
+        reason = _symlink_reason(clone_dir, m)
+        if reason:
+            skipped_skills.append(
+                {
+                    "skill": m.name,
+                    "source_path": m.skill_path.relative_to(clone_dir).as_posix(),
+                    "reason": reason,
+                }
             )
-            installed.append(m.name)
+            continue
+        selected.append(m)
 
-        if not installed:
-            where = repr(subdir) if subdir else "the repo"
-            raise HTTPException(
-                status_code=400, detail=f"no installable skills found under {where}"
+    if not selected:
+        where = repr(subdir) if subdir else "the repo"
+        detail = f"no installable skills found under {where}"
+        if skipped_skills:
+            detail += "; skipped: " + ", ".join(
+                f"{s['skill']} ({s['reason']})" for s in skipped_skills
             )
+        raise HTTPException(status_code=400, detail=detail)
 
-        origin = {m.name: str(m.skill_path.relative_to(clone_dir)) for m in manifests}
-        provenance = {
-            "repo_url": repo_url,
-            "ref": ref,
-            "resolved_sha": sha,
-            "subdir": subdir,
-            "skill_roots": sorted(str(p.relative_to(clone_dir)) for p in source_roots),
-            "skills": installed,
-            "requested": sorted(only) if only is not None else None,
-        }
-        # One record per installed skill, inside the skill. A single file at the
-        # install root would be read by every skill sharing that root via the
-        # parent lookup, so a later bundle would silently relabel an earlier
-        # one — and it would outlive an uninstall as a stale claim of provenance.
-        for name in installed:
-            try:
-                (root / name / ".parsec-provenance.json").write_text(
-                    json.dumps(
-                        {**provenance, "skill": name, "source_path": origin.get(name)},
-                        indent=2,
-                        sort_keys=True,
-                    )
-                    + "\n",
-                    encoding="utf-8",
+    # Measured over exactly what will land: the selected skills only, and
+    # only their regular files — the same walk the copy makes.
+    size = sum(tree_size(m.skill_path) for m in selected)
+    if size > INSTALL_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"bundle is {size} bytes, over the {INSTALL_MAX_BYTES} byte limit",
+        )
+
+    root.mkdir(parents=True, exist_ok=True)
+    installed: list[str] = []
+    skipped_symlinks: dict[str, list[str]] = {}
+    for m in selected:
+        dest = root / m.name
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        links = copy_skill_tree(m.skill_path, dest)
+        if links:
+            logger.warning("Installed %s without its symlinks: %s", m.name, links)
+            skipped_symlinks[m.name] = links
+        installed.append(m.name)
+
+    origin = {m.name: str(m.skill_path.relative_to(clone_dir)) for m in manifests}
+    provenance = {
+        "repo_url": repo_url,
+        "ref": ref,
+        "resolved_sha": sha,
+        "subdir": subdir,
+        "skill_roots": sorted(str(p.relative_to(clone_dir)) for p in source_roots),
+        "skills": installed,
+        "requested": sorted(only) if only is not None else None,
+    }
+    # One record per installed skill, inside the skill. A single file at the
+    # install root would be read by every skill sharing that root via the
+    # parent lookup, so a later bundle would silently relabel an earlier
+    # one — and it would outlive an uninstall as a stale claim of provenance.
+    for name in installed:
+        try:
+            (root / name / ".parsec-provenance.json").write_text(
+                json.dumps(
+                    {
+                        **provenance,
+                        "skill": name,
+                        "source_path": origin.get(name),
+                        "skipped_symlinks": skipped_symlinks.get(name, []),
+                    },
+                    indent=2,
+                    sort_keys=True,
                 )
-            except OSError:
-                logger.exception("Installed %s but could not write its provenance", name)
+                + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            logger.exception("Installed %s but could not write its provenance", name)
 
-        return installed, sha
+    return _InstallResult(installed, sha, skipped_symlinks, skipped_skills)
