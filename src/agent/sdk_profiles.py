@@ -123,7 +123,9 @@ def attachment_snapshot(config: Any = None) -> dict[str, Any]:
     )
 
 
-def skills_for(agent_type: str, config: Any = None) -> list[str]:
+def skills_for(
+    agent_type: str, config: Any = None, *, attachments: dict[str, Any] | None = None
+) -> list[str]:
     """Skills to preload for ``agent_type``, filtered to those actually shipped.
 
     A name that is not on disk would be silently ignored by the SDK, so it is
@@ -142,6 +144,10 @@ def skills_for(agent_type: str, config: Any = None) -> list[str]:
     caller runs under another config is the startup-vs-reload split that
     :func:`~src.skills.sdk_root.sdk_cwd` closed: the profile would filter
     against a root the skills were never published into and drop all of them.
+
+    ``attachments`` is an :func:`attachment_snapshot` the caller already
+    resolved for this config. Building every agent in one turn passes it, so
+    the manifests and the state file are read once per turn, not once per agent.
     """
     from src.skills.sdk_root import sdk_cwd
 
@@ -153,7 +159,8 @@ def skills_for(agent_type: str, config: Any = None) -> list[str]:
     try:
         from src.skills.attachment import skills_by_agent
 
-        wanted = skills_by_agent(attachment_snapshot(config)).get(agent_type, ())
+        snapshot = attachments if attachments is not None else attachment_snapshot(config)
+        wanted = skills_by_agent(snapshot).get(agent_type, ())
     except Exception:
         logger.exception(
             "Attachment resolution failed for agent %s; falling back to the static map",

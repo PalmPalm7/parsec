@@ -123,11 +123,25 @@ def _agent_definitions(config: Any) -> dict[str, Any]:
 
     from src.agent.agents import AGENTS
     from src.agent.parsec_mcp import tool_names_for
-    from src.agent.sdk_profiles import TURN_HEADROOM, enabled_sdk_agents, skills_for
+    from src.agent.sdk_profiles import (
+        TURN_HEADROOM,
+        attachment_snapshot,
+        enabled_sdk_agents,
+        skills_for,
+    )
     from src.agent.system_prompt import get_agent_prompt
 
     enabled = enabled_sdk_agents(config)
     definitions: dict[str, Any] = {}
+
+    # One discovery + state read for the whole turn rather than one per agent.
+    # On failure each agent's skills_for retries and falls back to the static map.
+    attachments: dict[str, Any] | None
+    try:
+        attachments = attachment_snapshot(config)
+    except Exception:
+        logger.exception("Attachment resolution failed; agents fall back to the static map")
+        attachments = None
 
     for agent_type, agent_cfg in AGENTS.items():
         if agent_type not in enabled:
@@ -148,7 +162,7 @@ def _agent_definitions(config: Any) -> dict[str, Any]:
             "tools": tool_names_for(list(agent_cfg.tools)),
             "maxTurns": agent_cfg.max_rounds + TURN_HEADROOM,
         }
-        skills = skills_for(agent_type, config)
+        skills = skills_for(agent_type, config, attachments=attachments)
         if skills:
             kwargs["skills"] = skills
         definitions[agent_type] = AgentDefinition(**kwargs)

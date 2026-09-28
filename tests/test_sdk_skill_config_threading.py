@@ -144,6 +144,29 @@ def test_orchestrator_agent_definitions_preload_the_configured_skill(split_roots
     assert defs["cost"].skills == [SKILL]
 
 
+def test_agent_definitions_resolve_attachments_once_per_turn(split_roots, _fake_sdk, monkeypatch):
+    """Six agents used to mean six full manifest loads and state reads before the SDK started."""
+    import src.agent.sdk_profiles as profiles
+    from src.agent.sdk_orchestrator import _agent_definitions
+
+    calls: list[object] = []
+    real = profiles.attachment_snapshot
+
+    def counting(config=None):
+        calls.append(config)
+        return real(config)
+
+    monkeypatch.setattr(profiles, "attachment_snapshot", counting)
+    cfg = _cfg(split_roots)
+    cfg["agent"]["sdk"]["enabled_agents"] = ["all"]
+
+    defs = _agent_definitions(cfg)
+
+    assert len(defs) > 1
+    assert defs["cost"].skills == [SKILL]
+    assert calls == [cfg]
+
+
 @pytest.mark.parametrize("make_cfg", [_cfg, _env_cfg], ids=["yaml", "env"])
 def test_translator_surfaces_skill_invoked_from_the_configured_root(split_roots, make_cfg):
     tr = SdkEventTranslator(question="q", history=[], config=make_cfg(split_roots))
