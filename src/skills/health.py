@@ -13,20 +13,25 @@ identically. This module supplies that vocabulary. It is deliberately read-only
 and side-effect free: it inspects manifests plus the tool surface Parsec
 actually grants, and returns a verdict.
 
-Three failure modes, all of which have real instances today:
+A verdict is one of three states — ``ok``, ``orphaned``, ``unusable`` — and
+both failing states have real instances today:
 
 * **unusable** — the skill's own procedure cannot run here. Either it asks for
   tools the subprocess does not expose (``Bash``, ``Read``, ``Write``), or its
   body references files that were never delivered alongside it.
 * **orphaned** — no agent can reach it. It loads, it lists, and no code path
   will ever activate it.
-* **degraded** — it works, but asks for at least one MCP tool that none of its
-  attached agents can call, so part of its procedure will silently no-op.
+
+A skill that names an MCP tool none of its attached agents can call is *not* a
+fourth state. Parsec approves bridged tools session-wide, so that is stale
+frontmatter rather than breakage, and it surfaces as a note (see :func:`assess`).
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import posixpath
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -73,6 +78,25 @@ _REF_RE = re.compile(
     r"(?<![\w./-])((?:" + "|".join(_PAYLOAD_DIRS) + r")/[\w][\w./-]*|requirements\.txt)"
 )
 
+#: A reference immediately followed by one of these may be the literal stem of
+#: a glob or placeholder: ``scripts/fetch-*.sh``, ``scripts/run_<n>.py``,
+#: ``templates/report-{name}.j2``, ``scripts/fetch-$ENV.sh``, ``data/2026[0-9]``.
+_STEM_FOLLOWERS = frozenset("*[{<$")
+
+#: After a ``*`` run, one of these means the pattern continues (a glob).
+#: Anything else — a space, ``-``, end of text — means the ``*`` closed Markdown
+#: emphasis around a plain reference: ``**scripts/cli.py**``.
+_GLOB_CONTINUES = re.compile(r"[A-Za-z0-9./\[{<$?]")
+
+#: Prose punctuation that trails a reference. ``-`` covers a dash ending a
+#: clause (``see scripts/cli.py-``), ``?`` a question or a URL-style query, and
+#: ``_`` underscore emphasis (``_run scripts/cli.py_``), which ``\w`` absorbs.
+_TRAILING_PUNCT = ".,);:`'\"?-_"
+
+#: A suffix glued onto a file extension by prose: ``scripts/cli.py-based``,
+#: ``scripts/cli.py--it prints JSON``. Group 1 is the file actually named.
+_EXT_SUFFIX_RE = re.compile(r"^(.*\.[A-Za-z0-9]+)-[^/]*$")
+
 #: A skill telling the model to build or use a Python virtualenv presumes a
 #: shell. Flagged separately from a missing file because the venv legitimately
 #: does not exist in the repo — its absence is not the problem, the assumption is.
@@ -83,7 +107,9 @@ _RUNTIME_RE = re.compile(r"\.venv|python3?\s+-m\s+venv|pip\s+install|npm\s+insta
 class SkillHealth:
     """Verdict for one skill against the tool surface Parsec actually grants."""
 
-    status: str  # "ok" | "orphaned" | "unusable"
+    #: "ok" | "orphaned" | "unusable". There is deliberately no "degraded":
+    #: tool names that do not resolve at runtime are reported in ``notes``.
+    status: str
     reasons: tuple[str, ...] = ()
     #: Non-blocking observations — frontmatter hygiene, naming drift. Kept
     #: separate from ``reasons`` on purpose: a health signal that fires on most
@@ -164,28 +190,99 @@ def _missing_payload_paths(manifest: SkillManifest) -> tuple[str, ...]:
     Matching is on the skill directory only — a reference is "missing" when the
     skill does not carry it, regardless of whether some other copy elsewhere on
     disk happens to have it.
+
+    An exact reference needs that exact path. There is no falling back to the
+    parent directory: that used to let ``scripts/cli.py`` pass whenever
+    ``scripts/`` existed, so a bundle missing the one file its procedure runs
+    reported ``ok``. A glob or placeholder reference needs at least one entry
+    in its directory whose name starts with the literal stem before the
+    wildcard — one ``scandir``, never a recursive walk — and is reported as
+    ``<stem>*``.
+
+    Work is bounded by the number of distinct references, never by the body
+    size: nothing here slices the body, so a SKILL.md at the loader's size cap
+    costs what its references cost.
     """
     root: Path = manifest.skill_path
-    seen: dict[str, None] = {}
-    for match in _REF_RE.finditer(manifest.body or ""):
-        rel = match.group(1).rstrip(".,);:`'\"")
-        if rel in seen:
+    body = manifest.body or ""
+    checked: set[str] = set()
+    missing: set[str] = set()
+    for match in _REF_RE.finditer(body):
+        raw = match.group(1)
+        if _is_stem(body, match.end(1)):
+            key, shown = raw + "*", raw + "*"
+        else:
+            key = shown = raw.rstrip(_TRAILING_PUNCT)
+        if key in checked:
             continue
-        # A trailing glob or placeholder is a documentation convention, not a
-        # concrete file; treat the directory as the thing that must exist.
-        probe = root / rel
+        checked.add(key)
         try:
-            if probe.exists():
-                continue
-            # `scripts/foo.py <ARG>` style references sometimes carry a suffix
-            # the regex kept; fall back to the parent directory before flagging.
-            if probe.parent.is_dir() and probe.parent != root:
-                continue
+            present, shown = (
+                (_stem_present(root, raw), shown)
+                if key.endswith("*")
+                else _exact_present(root, shown)
+            )
         except OSError:
-            logger.debug("Could not stat %s while checking skill %s", probe, manifest.name)
+            logger.debug("Could not stat %s while checking skill %s", key, manifest.name)
             continue
-        seen[rel] = None
-    return tuple(sorted(seen))
+        if not present:
+            missing.add(shown)
+    return tuple(sorted(missing))
+
+
+def _is_stem(body: str, end: int) -> bool:
+    """Whether the reference ending at ``end`` is the literal start of a pattern."""
+    follower = body[end : end + 1]
+    if not follower or follower not in _STEM_FOLLOWERS:
+        return False
+    if follower == "<":
+        # `scripts/cli.py</code>` is an HTML tag closing a plain reference.
+        return body[end + 1 : end + 2] != "/"
+    if follower == "*":
+        after = end
+        while body[after : after + 1] == "*":
+            after += 1
+        return bool(_GLOB_CONTINUES.match(body, after))
+    return True
+
+
+def _escapes(rel: str) -> bool:
+    """Whether ``rel`` climbs out of the skill directory, judged lexically.
+
+    Lexical on purpose: a reference that leaves the skill directory names
+    something the skill did not ship, whatever sits at that location on this
+    particular disk.
+    """
+    norm = posixpath.normpath(rel) if rel else "."
+    return norm == ".." or norm.startswith("../")
+
+
+def _exact_present(root: Path, rel: str) -> tuple[bool, str]:
+    """``(present, reported path)`` for a plain file reference."""
+    if _escapes(rel):
+        return False, rel
+    # Normalised first: `scripts/sub/../x` names `scripts/x` whether or not a
+    # `scripts/sub/` happens to exist for the OS to walk through.
+    if (root / posixpath.normpath(rel)).exists():
+        return True, rel
+    # `scripts/cli.py-based`: the file is `scripts/cli.py`. This narrows the
+    # reference to the file it names; it never widens it to a directory.
+    cut = _EXT_SUFFIX_RE.match(rel)
+    if cut and not _escapes(cut.group(1)):
+        return (root / posixpath.normpath(cut.group(1))).exists(), rel
+    return False, rel
+
+
+def _stem_present(root: Path, stem_ref: str) -> bool:
+    """Whether any entry in the stem's directory starts with the literal stem."""
+    head, _, stem = stem_ref.rpartition("/")
+    if _escapes(head):
+        return False
+    directory = root / head
+    if not directory.is_dir():
+        return False
+    with os.scandir(directory) as entries:
+        return any(e.name.startswith(stem) for e in entries)
 
 
 def assess(
@@ -231,8 +328,8 @@ def assess(
         reasons.append("procedure assumes a shell runtime (venv/pip/npm)")
 
     if not attached_agents:
-        # Orphaned outranks degraded but not unusable: a broken skill nobody can
-        # reach is still primarily broken.
+        # Orphaned never masks unusable: a broken skill nobody can reach is
+        # still primarily broken.
         if status == "ok":
             status = "orphaned"
         reasons.append("attached to no agent, so nothing can activate it")
