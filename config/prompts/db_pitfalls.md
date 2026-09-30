@@ -4,8 +4,9 @@
 SQL.** Do not guess column names — use ONLY columns listed in the schema
 reference. If unsure, call `db_describe_table` to check. Common mistakes:
 
-- `provisions` has NO `email` or `user_email` column — join `users u ON u.id = p.user_id`
-  and select `u.email`. The requesting user's name is in `ordered_by`.
+- `provisions` has NO `email` or `user_email` column.
+  p.ordered_by is the requester's email (FK to users.email; may be NULL). p.user_id → users is the assigned user and can differ.
+  For the assigned user's email, join `users u ON u.id = p.user_id` and select `u.email`.
 - `provisions` has NO `status` or `current_state` column — use `provision_result` and
   `last_state`.
 - `provisions` has `catalog_id` (NOT `catalog_item_id`, NOT `catalog_item_name`) — join

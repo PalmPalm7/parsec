@@ -97,7 +97,7 @@ fails outright.
 
 - `provisions.catalog_id` — not `catalog_item_id`, not `catalog_item_name`.
 - `provisions` has both `updated_at` and `modified_at` — use `modified_at`.
-- The requesting user's name is in `ordered_by`; the email comes from `users`.
+- p.ordered_by is the requester's email (FK to users.email; may be NULL). p.user_id → users is the assigned user and can differ.
 - `lifecycle_log` joins via `provision_uuid` (the provision `uuid`, not `babylon_guid`).
 - `provision_cost` is partitioned — always filter `month_ts`.
 - Alias every table when joining; shared column names produce ambiguous-column errors.

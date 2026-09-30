@@ -9,6 +9,7 @@ the pitfalls to every agent and keep the wrong tower_job_log fact from coming ba
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +17,13 @@ from src.agent import system_prompt
 from src.agent.system_prompt import _AGENT_PROMPT_FILES, get_agent_prompt, get_prompt_files
 
 USER_EMAIL_RULE = "`provisions` has NO `email` or `user_email` column"
+# describe_table provisions: ordered_by is a nullable FK to users.email, and it differs
+# from the user_id user's email in about 37% of last month's rows.
+ORDERED_BY_FACT = (
+    "p.ordered_by is the requester's email (FK to users.email; may be NULL). "
+    "p.user_id → users is the assigned user and can differ."
+)
+PROVISION_LOOKUP_SKILL = Path(__file__).resolve().parent.parent / "skills/provision-lookup/SKILL.md"
 
 
 @pytest.fixture(autouse=True)
@@ -112,3 +120,18 @@ def test_orchestrator_keeps_the_general_no_rows_delegate_rule() -> None:
     warnings = _flat(_section(prompt, "**High instance count", "**Multi-domain"))
     assert "delegate to `investigate_babylon` first" not in warnings
     assert "after the one `resource_claim_log` check" in warnings
+
+
+@pytest.mark.parametrize("agent_type", sorted(_AGENT_PROMPT_FILES))
+def test_every_prompt_says_ordered_by_is_the_requester_email(agent_type: str) -> None:
+    # The old text called ordered_by the requester's "name", so the model joined
+    # users on user_id for "who ordered it" — a different person in ~37% of rows.
+    prompt = get_agent_prompt(agent_type)
+    assert prompt.count(ORDERED_BY_FACT) == 1
+    assert "user's name is in `ordered_by`" not in prompt
+
+
+def test_provision_lookup_skill_says_ordered_by_is_the_requester_email() -> None:
+    skill = PROVISION_LOOKUP_SKILL.read_text()
+    assert ORDERED_BY_FACT in skill
+    assert "user's name is in `ordered_by`" not in skill
