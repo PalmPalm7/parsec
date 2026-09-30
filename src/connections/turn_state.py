@@ -1,10 +1,17 @@
 """Per-turn memory of backends that failed for a reason retrying cannot fix.
 
-A controller that rejects Parsec's credentials (HTTP 401/403) or a hostname
-that no longer resolves will fail the same way on every retry. Nothing
-remembered that within an investigation, so on the live pods one turn hit the
-same dead AAP2 controller and Babylon clusters dozens of times — 47 AAP2 and 27
-Babylon 401s in a single question.
+A controller that rejects Parsec's credentials (HTTP 401), or a host whose
+name does not exist in DNS or that refuses the connection, will fail the same
+way on every retry. Nothing remembered that within an investigation, so on the
+live pods one turn hit the same dead AAP2 controller and Babylon clusters
+dozens of times — 47 AAP2 and 27 Babylon 401s in a single question.
+
+Only those three reasons are recorded (:data:`CREDENTIALS_REJECTED`,
+:data:`HOST_NOT_FOUND`, :data:`CONNECTION_REFUSED`). HTTP 403 is not: on AAP2
+and Kubernetes it is per-object RBAC, so one forbidden resource must not block
+every other call to that controller or cluster. Nor is a connect failure that
+can clear on the next call, such as a resolver timeout, a TLS error or a
+connect timeout (see :func:`permanent_connect_failure`).
 
 The agent layer opens a scope per turn with :func:`begin_turn`; connectors
 record failures with :func:`mark_dead` and consult :func:`dead_reason` before
@@ -70,7 +77,11 @@ def end_turn(token: Token[dict[str, str] | None]) -> None:
 
 
 def mark_dead(target: str, reason: str) -> None:
-    """Remember that ``target`` (e.g. ``"aap2:prod0"``) failed unrecoverably."""
+    """Remember that ``target`` (e.g. ``"aap2:prod0"``) failed unrecoverably.
+
+    ``reason`` is one of the constants above; connectors word the error for
+    later calls from it.
+    """
     dead = _dead.get()
     if dead is not None:
         dead.setdefault(target, reason)
