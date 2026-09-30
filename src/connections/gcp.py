@@ -8,6 +8,9 @@ logger = logging.getLogger(__name__)
 
 _bq_client = None
 
+# Both billing clients (BigQuery, Resource Manager) accept this scope.
+_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+
 
 def get_gcp_credentials():
     """Credentials from gcp.credentials_path, or None to use Application Default Credentials.
@@ -15,14 +18,23 @@ def get_gcp_credentials():
     The file is loaded explicitly rather than exported as GOOGLE_APPLICATION_CREDENTIALS:
     on a Vertex deployment that variable already names the Vertex service account, so
     the billing clients silently ran as the wrong identity.
+
+    load_credentials_from_file reads the same file types ADC does (service_account,
+    authorized_user, external_account, impersonated_service_account). Before the
+    explicit load, credentials_path went through ADC, so a gcloud user file or a
+    Workload Identity Federation config was accepted; a service-account-only loader
+    would reject those with MalformedError.
     """
     creds_path = get_config().gcp.get("credentials_path", "")
     if not creds_path:
         return None
 
-    from google.oauth2 import service_account
+    import google.auth
 
-    return service_account.Credentials.from_service_account_file(creds_path)
+    credentials, _project = google.auth.load_credentials_from_file(
+        creds_path, scopes=[_CLOUD_PLATFORM_SCOPE]
+    )
+    return credentials
 
 
 def init_gcp() -> None:

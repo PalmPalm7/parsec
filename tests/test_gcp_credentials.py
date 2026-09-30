@@ -92,6 +92,32 @@ def test_init_leaves_google_application_credentials_alone(
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ
 
 
+def test_authorized_user_file_is_accepted(vertex_ambient_billing_configured, tmp_path: Path):
+    # gcp.credentials_path used to go through ADC, which takes a gcloud user file
+    # (and WIF configs) as well as SA keys; a service-account-only loader raised
+    # MalformedError on it and took GCP down.
+    user_file = tmp_path / "adc-user.json"
+    user_file.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "client_id": "billing-client.apps.googleusercontent.com",
+                "client_secret": "not-a-secret",
+                "refresh_token": "billing-refresh-token",
+            }
+        )
+    )
+    vertex_ambient_billing_configured["gcp_cfg"]["credentials_path"] = str(user_file)
+
+    gcp.init_gcp()
+
+    client = gcp.get_bq_client()
+    assert client is not None
+    assert client._credentials.refresh_token == "billing-refresh-token"
+    projects = gcp_projects._get_projects_client()
+    assert projects._transport._credentials.refresh_token == "billing-refresh-token"
+
+
 def test_no_credentials_path_falls_back_to_adc(vertex_ambient_billing_configured):
     # Local development runs on gcloud ADC with no service-account file configured.
     del vertex_ambient_billing_configured["gcp_cfg"]["credentials_path"]
