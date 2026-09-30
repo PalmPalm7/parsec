@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from src.config import get_config
+from src.connections.gcp import get_gcp_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ def _get_folder_id() -> str:
 def _get_projects_client():
     from google.cloud import resourcemanager_v3
 
-    return resourcemanager_v3.ProjectsClient()
+    return resourcemanager_v3.ProjectsClient(credentials=get_gcp_credentials())
 
 
 def _list_projects(

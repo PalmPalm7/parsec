@@ -1,13 +1,28 @@
 """GCP BigQuery client for billing queries."""
 
 import logging
-import os
 
 from src.config import get_config
 
 logger = logging.getLogger(__name__)
 
 _bq_client = None
+
+
+def get_gcp_credentials():
+    """Credentials from gcp.credentials_path, or None to use Application Default Credentials.
+
+    The file is loaded explicitly rather than exported as GOOGLE_APPLICATION_CREDENTIALS:
+    on a Vertex deployment that variable already names the Vertex service account, so
+    the billing clients silently ran as the wrong identity.
+    """
+    creds_path = get_config().gcp.get("credentials_path", "")
+    if not creds_path:
+        return None
+
+    from google.oauth2 import service_account
+
+    return service_account.Credentials.from_service_account_file(creds_path)
 
 
 def init_gcp() -> None:
@@ -21,14 +36,16 @@ def init_gcp() -> None:
         logger.warning("GCP project_id not configured — GCP tools disabled")
         return
 
-    creds_path = gcp_cfg.get("credentials_path", "")
-    if creds_path:
-        os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", creds_path)
+    credentials = get_gcp_credentials()
 
     from google.cloud import bigquery
 
-    _bq_client = bigquery.Client(project=project_id)
-    logger.info("GCP BigQuery client initialized (project=%s)", project_id)
+    _bq_client = bigquery.Client(project=project_id, credentials=credentials)
+    logger.info(
+        "GCP BigQuery client initialized (project=%s, credentials=%s)",
+        project_id,
+        gcp_cfg.get("credentials_path", "") or "ADC",
+    )
 
 
 def get_bq_client():
