@@ -43,8 +43,12 @@ async def _require_api_key(x_api_key: Annotated[str | None, Header()] = None) ->
     unauthenticated caller with a bad body got a 422 that spelled out the
     request schema instead of a 401. compare_digest keeps the comparison
     constant-time; both sides are bytes because it refuses non-ASCII str.
+
+    The configured key is coerced to str first: Dynaconf casts an all-digit
+    PARSEC_ALERT_API_KEY to an int, which has no .encode(), so every keyed
+    request would be a 500 instead of an answer.
     """
-    configured_key = get_config().get("alert_api_key", "")
+    configured_key = str(get_config().get("alert_api_key", "") or "")
 
     if not configured_key:
         raise HTTPException(

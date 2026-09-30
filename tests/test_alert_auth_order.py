@@ -21,7 +21,7 @@ BAD_BODY = {"account_name": "missing every required field"}
 
 
 class _Cfg:
-    def __init__(self, key: str) -> None:
+    def __init__(self, key: object) -> None:
         self._key = key
 
     def get(self, name, default=""):
@@ -41,7 +41,7 @@ def client(monkeypatch):
     return TestClient(app, raise_server_exceptions=False)
 
 
-def _configure(monkeypatch, key: str) -> None:
+def _configure(monkeypatch, key: object) -> None:
     monkeypatch.setattr("src.routes.alert.get_config", lambda: _Cfg(key))
 
 
@@ -99,3 +99,21 @@ def test_non_ascii_key_is_a_401_not_a_500(client, monkeypatch):
     )
 
     assert resp.status_code == 401
+
+
+@pytest.mark.parametrize(
+    ("header", "status"),
+    [("123456", 422), ("654321", 401)],
+    ids=["right-key", "wrong-key"],
+)
+def test_numeric_configured_key_is_compared_not_a_500(client, monkeypatch, header, status):
+    """Dynaconf casts PARSEC_ALERT_API_KEY=123456 to the int 123456.
+
+    The dependency must compare it as the string the caller sends: the right
+    key gets through to body validation (422 on a bad body), a wrong key is a
+    401, and neither is an AttributeError 500.
+    """
+    _configure(monkeypatch, 123456)
+    resp = client.post("/api/alert/investigate", json=BAD_BODY, headers={"X-API-Key": header})
+
+    assert resp.status_code == status
