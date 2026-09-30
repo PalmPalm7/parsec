@@ -115,7 +115,6 @@ class TestCheckUserAllowed:
         """Groups configured but no user identity -> 403."""
         cfg = _make_config(allowed_groups="rhpds-admins")
         monkeypatch.setattr("src.routes.query.get_config", lambda: cfg)
-        monkeypatch.setattr("src.routes.query._log_identity_debug", lambda r: None)
         with pytest.raises(HTTPException) as exc_info:
             await _check_user_allowed(_make_request(), None)
         assert exc_info.value.status_code == 403
@@ -125,7 +124,6 @@ class TestCheckUserAllowed:
         """Groups configured and user in allowed group -> pass."""
         cfg = _make_config(allowed_groups="rhpds-admins")
         monkeypatch.setattr("src.routes.query.get_config", lambda: cfg)
-        monkeypatch.setattr("src.routes.query._log_identity_debug", lambda r: None)
         monkeypatch.setattr(
             "src.routes.query._check_group_access",
             AsyncMock(return_value=True),
@@ -138,7 +136,6 @@ class TestCheckUserAllowed:
         """No groups, no email list -> allow all."""
         cfg = _make_config(allowed_groups="", allowed_users="")
         monkeypatch.setattr("src.routes.query.get_config", lambda: cfg)
-        monkeypatch.setattr("src.routes.query._log_identity_debug", lambda r: None)
         # Should not raise even with no user
         await _check_user_allowed(_make_request(), None)
 
@@ -150,7 +147,6 @@ class TestCheckUserAllowed:
             allowed_users="alice@redhat.com,bob@redhat.com",
         )
         monkeypatch.setattr("src.routes.query.get_config", lambda: cfg)
-        monkeypatch.setattr("src.routes.query._log_identity_debug", lambda r: None)
         # Should not raise
         await _check_user_allowed(_make_request(), "alice@redhat.com")
 
@@ -162,7 +158,6 @@ class TestCheckUserAllowed:
             allowed_users="alice@redhat.com",
         )
         monkeypatch.setattr("src.routes.query.get_config", lambda: cfg)
-        monkeypatch.setattr("src.routes.query._log_identity_debug", lambda r: None)
         with pytest.raises(HTTPException) as exc_info:
             await _check_user_allowed(_make_request(), "hacker@evil.com")
         assert exc_info.value.status_code == 403
@@ -176,7 +171,6 @@ class TestCheckUserAllowed:
             allowed_users="alice@redhat.com",
         )
         monkeypatch.setattr("src.routes.query.get_config", lambda: cfg)
-        monkeypatch.setattr("src.routes.query._log_identity_debug", lambda r: None)
         with pytest.raises(HTTPException) as exc_info:
             await _check_user_allowed(_make_request(), None)
         assert exc_info.value.status_code == 403
@@ -186,6 +180,5 @@ class TestCheckUserAllowed:
         """Email list with only whitespace entries -> allow all."""
         cfg = _make_config(allowed_groups="", allowed_users="  ,  , ")
         monkeypatch.setattr("src.routes.query.get_config", lambda: cfg)
-        monkeypatch.setattr("src.routes.query._log_identity_debug", lambda r: None)
         # After parsing, the set is empty -> no restriction
         await _check_user_allowed(_make_request(), None)
