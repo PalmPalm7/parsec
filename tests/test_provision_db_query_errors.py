@@ -71,6 +71,13 @@ def test_undefined_column_hint_states_what_ordered_by_really_holds():
     assert "requester's name" not in hint
 
 
+def test_undefined_column_hint_says_mixed_case_columns_need_quotes():
+    # tower_job_log and provision_job have camelCase columns; unquoted, tl.deployerJob
+    # is read as tl.deployerjob and fails (staging q13, twice).
+    hint = _run(_UNDEFINED_COLUMN_WITH_HINT)["hint"]
+    assert 'tl."deployerJob"' in hint and "HINT" in hint
+
+
 def test_postgres_hint_line_survives_and_the_sql_echo_does_not():
     result = _run(_UNDEFINED_COLUMN_WITH_HINT)
     assert result["error"] == (

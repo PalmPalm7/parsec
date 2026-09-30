@@ -46,9 +46,11 @@ _QUERY_ERROR_HINTS = {
     # always sent and says it is about provisions. Most live UndefinedColumnErrors
     # were p.user_email.
     "UndefinedColumnError": (
-        "A column in this query does not exist. Call db_describe_table on the table "
-        "before retrying instead of guessing column names. provisions has no user_email "
-        f"or email column. {_ORDERED_BY_FACT}"
+        "A column in this query does not exist. If the error has a HINT, use the column "
+        'it names; mixed-case columns must be double-quoted (tl."deployerJob"), since '
+        "unquoted names are folded to lower case. Otherwise call db_describe_table on the "
+        "table before retrying instead of guessing column names. provisions has no "
+        f"user_email or email column. {_ORDERED_BY_FACT}"
     ),
     "QueryCanceledError": (
         "The query hit the database statement timeout. Run the indexed exact match "
