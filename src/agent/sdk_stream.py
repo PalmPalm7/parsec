@@ -60,6 +60,9 @@ class SdkEventTranslator:
         self._skills_seen: set[str] = set()
         self._usage: Any | None = None
         self._session_id: str | None = None
+        #: Set by the caller when it stops the run itself (e.g. the turn timed
+        #: out); takes precedence over what the ResultMessage would imply.
+        self._forced_failure: str | None = None
 
     # ------------------------------------------------------------- input
 
@@ -245,6 +248,8 @@ class SdkEventTranslator:
         So misconfiguration is named as misconfiguration, with the raw text kept
         alongside for whoever reads the log.
         """
+        if self._forced_failure:
+            return self._forced_failure
         msg = self._usage
         if msg is None:
             return "the agent runtime produced no result"
@@ -266,6 +271,10 @@ class SdkEventTranslator:
             if any(needle in lowered for needle in needles):
                 return f"{hint} (the runtime said: {detail})"
         return f"the agent runtime failed: {detail}"
+
+    def fail(self, reason: str) -> None:
+        """Record why the caller stopped this run; :meth:`finish` reports it once."""
+        self._forced_failure = reason
 
     # ------------------------------------------------------------ finish
 

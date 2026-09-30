@@ -28,6 +28,7 @@ produced them.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncGenerator, Iterable
 from typing import Any, cast
@@ -352,6 +353,35 @@ def _sdk_section_safe(config: Any) -> dict:
     return _sdk_section(config)
 
 
+#: Wall-clock ceiling for one whole orchestrator turn, sub-agents included.
+#: ``agent.sdk.timeout`` (300s) bounds a single sub-agent call on the per-agent
+#: path; the whole-turn path had no ceiling at all, so a hung CLI held the
+#: request open until the browser gave up. Longer than the per-call limit on
+#: purpose: real multi-agent investigations run 2-7 minutes.
+DEFAULT_TURN_TIMEOUT_S = 900.0
+
+
+def _sdk_section_of(config: Any) -> dict[str, Any]:
+    from src.agent.sdk_profiles import _sdk_section
+
+    return _sdk_section(config)
+
+
+def _turn_timeout(sdk_cfg: dict[str, Any]) -> float | None:
+    """``agent.sdk.turn_timeout`` in seconds; 0/null disables, junk falls back."""
+    raw = sdk_cfg.get("turn_timeout", DEFAULT_TURN_TIMEOUT_S)
+    if raw in (None, ""):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "agent.sdk.turn_timeout=%r is not a number; using %ss", raw, DEFAULT_TURN_TIMEOUT_S
+        )
+        return DEFAULT_TURN_TIMEOUT_S
+    return value if value > 0 else None
+
+
 async def run_agent_via_sdk(
     question: str,
     conversation_history: list | None = None,
@@ -397,18 +427,46 @@ async def run_agent_via_sdk(
 
     cache_token = _tool_cache.set({})
 
+    turn_timeout = _turn_timeout(_sdk_section_of(cfg))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + turn_timeout if turn_timeout else None
+
+    def _remaining() -> float | None:
+        if deadline is None:
+            return None
+        left = deadline - loop.time()
+        if left <= 0:
+            raise TimeoutError
+        return left
+
     token = sse_sink.set(translator.push)
     try:
         from claude_agent_sdk import ClaudeSDKClient
 
+        # The ceiling is applied to each await, not with `asyncio.timeout()`
+        # around the loop: this is an async generator, and a cancellation that
+        # lands while it is suspended at a `yield` would be raised inside the
+        # response writer instead, killing the stream with no error event.
         async with ClaudeSDKClient(options) as client:
-            await client.query(prompt)
-            async for message in client.receive_response():
+            await asyncio.wait_for(client.query(prompt), _remaining())
+            messages = client.receive_response().__aiter__()
+            while True:
+                try:
+                    message = await asyncio.wait_for(anext(messages), _remaining())
+                except StopAsyncIteration:
+                    break
                 for event in translator.translate(message):
                     yield event
                 # Drain anything the bridge queued while that message was handled.
                 for event in translator.drain():
                     yield event
+    except TimeoutError:
+        # Leaving the `async with` above has already stopped the CLI subprocess.
+        logger.warning("SDK orchestrator turn exceeded agent.sdk.turn_timeout=%ss", turn_timeout)
+        translator.fail(
+            f"the investigation was stopped after {int(turn_timeout or 0)}s "
+            "(agent.sdk.turn_timeout) — narrow the question or raise the limit"
+        )
     except Exception as e:
         logger.exception("SDK orchestrator failed")
         yield sse_error(str(e))
