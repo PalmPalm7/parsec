@@ -5,6 +5,8 @@ import logging
 import re
 from typing import Any
 
+import httpx
+
 from src.connections.babylon import (
     get_configured_clusters,
     k8s_get,
@@ -627,6 +629,11 @@ def _extract_multi_workshop_info(mw: dict) -> dict:
     }
 
 
+def _is_not_found(exc: Exception) -> bool:
+    """True when the API server answered 404, i.e. the object is really absent."""
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404
+
+
 def _resolve_cluster_target(cluster: str, sandbox_comment: str) -> str:
     """Resolve target cluster from explicit name or sandbox comment."""
     if cluster:
@@ -749,7 +756,15 @@ async def _search_all_clusters_for_guid(
     guid: str,
     max_results: int,
 ) -> dict:
-    """Search all configured clusters for a GUID, stopping when found."""
+    """Search all configured clusters for a GUID, stopping when found.
+
+    A cluster that could not be searched is not a cluster where the GUID is
+    absent. On the live pods every cluster answered 401 or failed DNS and this
+    still came back as an empty, error-free "0 subjects", which the agents
+    reported as "not found".
+    """
+    items_key = "subjects" if action == "list_anarchy_subjects" else "actions"
+    failed: list[str] = []
     errors: list[str] = []
 
     for cluster_name in clusters:
@@ -762,22 +777,33 @@ async def _search_all_clusters_for_guid(
                 result = await _list_anarchy_actions(
                     cluster_name, namespace, search, guid, max_results
                 )
-
-            items_key = "subjects" if action == "list_anarchy_subjects" else "actions"
-            if result.get(items_key):
-                return result
-            if result.get("errors"):
-                errors.extend(f"{cluster_name}: {e}" for e in result["errors"])
         except Exception as e:
-            errors.append(f"{cluster_name}: {e}")
+            result = {"error": str(e)}
 
-    return {
-        "clusters_searched": clusters,
-        "subjects" if action == "list_anarchy_subjects" else "actions": [],
+        if result.get(items_key):
+            return result
+        if "error" in result:
+            failed.append(cluster_name)
+            errors.extend(f"{cluster_name}: {e}" for e in result.get("errors") or [result["error"]])
+
+    if failed and len(failed) == len(clusters):
+        return {
+            "error": f"Could not search any Babylon cluster for GUID '{guid}': every "
+            "cluster failed, so this is not a 'not found'.",
+            "errors": errors,
+        }
+
+    out: dict[str, Any] = {
+        "clusters_searched": [c for c in clusters if c not in failed],
+        items_key: [],
         "count": 0,
         "truncated": False,
         "errors": errors if errors else None,
     }
+    if failed:
+        out["incomplete"] = True
+        out["unsearched_clusters"] = failed
+    return out
 
 
 async def _search_catalog(cluster: str, search: str, env_type: str, max_results: int) -> dict:
@@ -1071,6 +1097,14 @@ async def _list_anarchy_subjects(
         except Exception as e:
             errors.append(f"cluster-wide: {e}")
 
+    if errors and not filtered:
+        # Nothing was listed, so an empty result would read as "no such subject".
+        return {
+            "error": f"Could not list AnarchySubjects on {cluster}: {'; '.join(errors)}",
+            "cluster": cluster,
+            "errors": errors,
+        }
+
     return {
         "cluster": cluster,
         "subjects": filtered,
@@ -1230,11 +1264,14 @@ async def _get_workshop(
                 return {
                     "error": f"Workshop '{name}' not found on cluster {cluster}.",
                     "cluster": cluster,
+                    "not_found": True,
                 }
         except Exception as e:
             return {
                 "error": f"Failed to search for Workshop {name}: {e}",
                 "cluster": cluster,
+                # 404 on the list itself: this cluster has no Workshop type at all.
+                "not_found": _is_not_found(e),
             }
 
     # Fetch the Workshop
@@ -1251,6 +1288,7 @@ async def _get_workshop(
         return {
             "error": f"Failed to get Workshop {name} in {namespace}: {e}",
             "cluster": cluster,
+            "not_found": _is_not_found(e),
         }
 
     ws_meta = ws.get("metadata", {})
@@ -1283,6 +1321,21 @@ async def _get_workshop(
     return result
 
 
+def _not_found_on_any_cluster(kind: str, name: str, clusters: list[str], errors: list[str]) -> dict:
+    """The result of an all-cluster lookup by name that matched nothing.
+
+    Says "not found" only when every cluster was actually searched. The lookups
+    used to drop each cluster's error, so with every cluster answering 401 the
+    agent was told the Workshop did not exist.
+    """
+    if errors:
+        return {
+            "error": f"Could not search {len(errors)}/{len(clusters)} Babylon clusters for "
+            f"{kind} '{name}', so it may still exist: {errors}",
+        }
+    return {"error": f"{kind} '{name}' not found on any cluster. Searched: {clusters}."}
+
+
 async def _search_all_clusters_for_workshop(
     clusters: list[str],
     name: str,
@@ -1294,15 +1347,14 @@ async def _search_all_clusters_for_workshop(
     for cluster_name in clusters:
         try:
             result = await _get_workshop(cluster_name, name, namespace)
-            if "error" not in result or "resource_claims" in result:
-                return result
         except Exception as e:
-            errors.append(f"{cluster_name}: {e}")
+            result = {"error": str(e)}
+        if "error" not in result or "resource_claims" in result:
+            return result
+        if not result.get("not_found"):
+            errors.append(f"{cluster_name}: {result['error']}")
 
-    return {
-        "error": f"Workshop '{name}' not found on any cluster. "
-        f"Searched: {clusters}. Errors: {errors}",
-    }
+    return _not_found_on_any_cluster("Workshop", name, clusters, errors)
 
 
 async def _list_anarchy_actions(
@@ -1365,6 +1417,13 @@ async def _list_anarchy_actions(
         filtered.append(info)
         if len(filtered) >= max_results:
             break
+
+    if errors and not filtered:
+        return {
+            "error": f"Could not list AnarchyActions on {cluster}: {'; '.join(errors)}",
+            "cluster": cluster,
+            "errors": errors,
+        }
 
     return {
         "cluster": cluster,
@@ -1461,11 +1520,13 @@ async def _get_multiworkshop(
                 return {
                     "error": f"MultiWorkshop '{name}' not found on cluster {cluster}.",
                     "cluster": cluster,
+                    "not_found": True,
                 }
         except Exception as e:
             return {
                 "error": f"Failed to search for MultiWorkshop {name}: {e}",
                 "cluster": cluster,
+                "not_found": _is_not_found(e),
             }
 
     # 1. Fetch the MultiWorkshop
@@ -1482,6 +1543,7 @@ async def _get_multiworkshop(
         return {
             "error": f"Failed to get MultiWorkshop {name} in {namespace}: {e}",
             "cluster": cluster,
+            "not_found": _is_not_found(e),
         }
 
     mw_meta = mw.get("metadata", {})
@@ -1566,15 +1628,14 @@ async def _search_all_clusters_for_multiworkshop(
     for cluster_name in clusters:
         try:
             result = await _get_multiworkshop(cluster_name, name, namespace)
-            if "error" not in result or "workshops" in result:
-                return result
         except Exception as e:
-            errors.append(f"{cluster_name}: {e}")
+            result = {"error": str(e)}
+        if "error" not in result or "workshops" in result:
+            return result
+        if not result.get("not_found"):
+            errors.append(f"{cluster_name}: {result['error']}")
 
-    return {
-        "error": f"MultiWorkshop '{name}' not found on any cluster. "
-        f"Searched: {clusters}. Errors: {errors}",
-    }
+    return _not_found_on_any_cluster("MultiWorkshop", name, clusters, errors)
 
 
 async def _get_babylon_pod_logs(

@@ -21,6 +21,27 @@ _FORBIDDEN_PATTERN = re.compile(
 
 _ROW_COUNT_PATTERN = re.compile(r"(\d+) rows? returned")
 
+#: The Reporting MCP returns a failed query as an ordinary text result starting
+#: with this prefix, not as an MCP error, so it arrived as ``{"result": ...}``.
+#: The model, ToolStats and the metrics all read that as a successful call.
+_QUERY_ERROR_PREFIX = "Query error:"
+
+#: What to do next for the database errors the agents actually hit, keyed by the
+#: asyncpg exception class named in the error text.
+_QUERY_ERROR_HINTS = {
+    "UndefinedColumnError": (
+        "A column in this query does not exist. Call db_describe_table on the table "
+        "before retrying instead of guessing column names. provisions has no user_email "
+        "or email column: JOIN users u ON u.id = p.user_id for the email; the "
+        "requester's name is p.ordered_by."
+    ),
+    "QueryCanceledError": (
+        "The query hit the database statement timeout. Run the indexed exact match "
+        "alone first (e.g. WHERE p.babylon_guid = '<guid>') and only then add "
+        "leading-wildcard ILIKE '%...%' or OR-ed conditions, with a date range."
+    ),
+}
+
 #: String literals, quoted identifiers and comments, matched left to right the
 #: way the SQL lexer would. None of them can contain executable SQL, so they are
 #: blanked before the keyword and statement checks.
@@ -66,6 +87,21 @@ def validate_sql(sql: str) -> str | None:
     return None
 
 
+def _query_error(text: str) -> dict:
+    """Turn a Reporting-MCP ``Query error: ...`` text into an ``{"error"}`` result.
+
+    Keeps only the first line: the rest is SQLAlchemy's echo of the SQL the model
+    just wrote and a link to its docs.
+    """
+    message = text.strip().splitlines()[0]
+    error: dict[str, str] = {"error": message}
+    for exc_name, hint in _QUERY_ERROR_HINTS.items():
+        if exc_name in message:
+            error["hint"] = hint
+            break
+    return error
+
+
 async def execute_query(sql: str) -> dict:
     """Execute a read-only SQL query via Reporting MCP."""
     error = validate_sql(sql)
@@ -85,6 +121,10 @@ async def execute_query(sql: str) -> dict:
             "output_format": "markdown",
         },
     )
+
+    text = result.get("result", "")
+    if isinstance(text, str) and text.lstrip().startswith(_QUERY_ERROR_PREFIX):
+        return _query_error(text)
 
     if "error" not in result:
         match = _ROW_COUNT_PATTERN.search(result.get("result", ""))
