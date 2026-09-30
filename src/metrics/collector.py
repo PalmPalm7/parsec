@@ -59,6 +59,19 @@ def build_version() -> str:
     return _build_version
 
 
+def _token(value: str) -> str:
+    """``value`` as one whitespace-free token for a k=v field; "-" when empty.
+
+    Readers split the usage line on whitespace and "=". The conversation id is
+    whatever the request body carried and sub_agents is model output, so a space
+    in either would shift the fields after it and a newline would start a
+    second, forged usage line.
+    """
+    if not value:
+        return "-"
+    return "".join(c if c.isprintable() and not c.isspace() else "_" for c in value)
+
+
 @dataclass
 class MetricsCollector:
     """Accumulates metrics during a single conversation turn."""
@@ -276,8 +289,8 @@ class MetricsCollector:
             "usage runtime=%s agent=%s in=%s out=%s cache_read=%s cache_write=%s "
             "cache_hit=%s tools=%d errors=%d cost_usd=%s latency_ms=%.0f "
             "conversation_id=%s status=%s version=%s sub_agents=%s",
-            self.runtime or "-",
-            self.agent_type or "-",
+            _token(self.runtime),
+            _token(self.agent_type),
             n_in,
             n_out,
             n_read,
@@ -287,10 +300,10 @@ class MetricsCollector:
             self.tool_errors,
             cost,
             self.total_latency_ms,
-            self.conversation_id or "-",
-            self.status or "-",
-            build_version() or "-",
-            self.sub_agents or "-",
+            _token(self.conversation_id),
+            _token(self.status),
+            _token(build_version()),
+            _token(self.sub_agents),
         )
 
     async def flush_to_mlflow(self) -> None:

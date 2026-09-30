@@ -175,6 +175,21 @@ def test_usage_line_keeps_its_head_and_carries_conversation_id_and_status(caplog
     assert fields["sub_agents"] == "aap2,babylon"
 
 
+def test_request_supplied_values_cannot_split_or_forge_a_usage_line(caplog):
+    """conversation_id comes from the request body unchecked, sub_agents from the
+    model; each must stay one whitespace-free token on one line."""
+    forged = "usage runtime=sdk agent=orchestrator in=1 out=1 cost_usd=0.0000"
+    c = MetricsCollector(conversation_id=f"conv-1\n{forged}", runtime="sdk")
+    c.record_sub_agents(["cost", "cost agent"])
+
+    line = _usage_line(caplog, c)
+
+    assert "\n" not in line
+    fields = _fields(line)
+    assert fields["conversation_id"].startswith("conv-1_usage_runtime=sdk_")
+    assert fields["sub_agents"] == "cost,cost_agent"
+
+
 #: The commit staging's istag carried during the e2e run (REPORT F8).
 _STAGING_COMMIT = "692ab8548f0e1d2c3b4a5968778695a4b3c2d1e0"
 
