@@ -201,7 +201,7 @@ async def test_unknown_agent_type_is_left_alone():
 async def test_options_wire_the_hook_to_each_subagents_real_limit(_sdk_stub):
     opts = _options(_cfg())
 
-    assert set(opts.hooks) == {"PostToolUse", "PostToolUseFailure"}
+    assert {"PostToolUse", "PostToolUseFailure"} <= set(opts.hooks)
     hook = opts.hooks["PostToolUse"][0].hooks[0]
     assert _warned(await _fire(hook, _post("c1", "cost"), 20)) == [17]
     assert _warned(await _fire(hook, _post("x1", "aap2"), 23)) == [20]

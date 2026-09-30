@@ -214,6 +214,15 @@ def _union_tool_schemas() -> list[dict]:
     return list(seen.values())
 
 
+def _tool_owners(agents: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each bridged tool name to the enabled sub-agents that may call it."""
+    owners: dict[str, list[str]] = {}
+    for agent_type, definition in agents.items():
+        for name in definition.tools or ():
+            owners.setdefault(name, []).append(agent_type)
+    return owners
+
+
 def build_orchestrator_options(config: Any, *, system: str) -> Any:
     """Assemble ``ClaudeAgentOptions`` for one orchestrator turn."""
     from claude_agent_sdk import ClaudeAgentOptions
@@ -221,6 +230,7 @@ def build_orchestrator_options(config: Any, *, system: str) -> Any:
     from src.agent.parsec_mcp import SERVER_NAME, build_server, tool_names_for
     from src.agent.sdk_hooks import build_hooks
     from src.agent.sdk_profiles import _sdk_section
+    from src.agent.tool_definitions import get_orchestrator_direct_tools
     from src.llm.agent_sdk_client import (
         AgentSdkConfig,
         backend_cli_env,
@@ -243,10 +253,13 @@ def build_orchestrator_options(config: Any, *, system: str) -> Any:
     # refused: the icinga agent reported "unable to access the monitoring system
     # due to permission restrictions" and answered with no tool calls at all.
     #
-    # This does not widen what any individual agent can reach — availability is
-    # still per-agent via `AgentDefinition.tools` (see `_agent_definitions`).
-    # Approval is session-wide; availability is per-agent.
+    # Approval is session-wide, so it does widen what the main thread can
+    # reach: the orchestrator could call every specialist tool itself, and on
+    # the live pods it did instead of delegating. Sub-agents are narrowed by
+    # `AgentDefinition.tools` (see `_agent_definitions`); the main thread is
+    # narrowed to its own direct tools by the PreToolUse guard in sdk_hooks.
     approved_tools = tool_names_for(schemas)
+    direct_tools = tool_names_for(get_orchestrator_direct_tools())
 
     anthropic_cfg = _section_get(config, "anthropic")
     model = sdk_cfg.get("model") or anthropic_cfg.get("model") or "claude-sonnet-4-6"
@@ -272,9 +285,12 @@ def build_orchestrator_options(config: Any, *, system: str) -> Any:
         system_prompt=system,
         max_turns=max_turns,
         agents=agents,
-        # Warns each sub-agent before its maxTurns, as the legacy loop does.
+        # Warns each sub-agent before its maxTurns, as the legacy loop does, and
+        # keeps specialist tools off the main thread.
         hooks=build_hooks(
-            turn_limits={name: d.maxTurns for name, d in agents.items() if d.maxTurns}
+            turn_limits={name: d.maxTurns for name, d in agents.items() if d.maxTurns},
+            direct_tools=direct_tools,
+            tool_owners=_tool_owners(agents),
         ),
         mcp_servers={SERVER_NAME: server},
         allowed_tools=[*approved_tools, *_ORCHESTRATOR_EXTRA_TOOLS],
