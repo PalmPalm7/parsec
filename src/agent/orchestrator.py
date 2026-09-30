@@ -420,13 +420,41 @@ async def _execute_tool(tool_name: str, tool_input: dict) -> dict:
         return await _execute_github_tool(tool_name, tool_input)
 
     if tool_name == "render_chart":
-        # Charts are rendered client-side — just return the input as-is
-        return tool_input
+        return _render_chart(tool_input)
 
     if tool_name == "generate_report":
         return _save_report(tool_input)
 
     return {"error": f"Unknown tool: {tool_name}"}
+
+
+def _render_chart(tool_input: dict) -> dict:
+    """Return the chart for the client to render, or an error if it has nothing to show.
+
+    Charts are rendered client-side, so a valid chart goes back as-is. One with
+    no data points, or only zeros, would render as an empty frame the user
+    cannot tell from a broken UI; it almost always means the query behind it
+    came back empty, which the answer should say in words. The error also keeps
+    the chart event from being sent at all.
+    """
+    values = [
+        value
+        for dataset in tool_input.get("datasets") or []
+        if isinstance(dataset, dict)
+        for value in dataset.get("data") or []
+        if isinstance(value, int | float)
+    ]
+    if not values:
+        return {
+            "error": "render_chart: no data points — every dataset is empty. Do not chart "
+            "an empty result; say in the answer that the query returned no data."
+        }
+    if not any(values):
+        return {
+            "error": "render_chart: every data point is 0, so the chart would be blank. Do "
+            "not chart it; say in the answer that the values are all zero."
+        }
+    return tool_input
 
 
 def _save_report(tool_input: dict) -> dict:
@@ -1191,6 +1219,11 @@ async def run_agent(
             metadata={"mlflow.trace.session": session_id},
         )
 
+    # Per-turn like _tool_cache: connectors remember a target that failed for
+    # good (401/403, DNS) until this turn ends. Closed in the finally below.
+    from src.connections import turn_state
+
+    dead_token = turn_state.begin_turn()
     try:
         # Fast-path: skip orchestrator for obvious single-domain queries
         fast_agent = classify_fast(question)
@@ -1346,6 +1379,7 @@ async def run_agent(
             total_output_tokens=collector.output_tokens,
         )
         span_ctx.__exit__(*sys.exc_info())
+        turn_state.end_turn(dead_token)
 
 
 def _build_alert_user_message(

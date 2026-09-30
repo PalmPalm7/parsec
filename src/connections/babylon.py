@@ -5,12 +5,14 @@ import os
 import ssl
 import tempfile
 from base64 import b64decode
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 import yaml
 
 from src.config import get_config
+from src.connections import turn_state
 
 logger = logging.getLogger(__name__)
 
@@ -246,19 +248,91 @@ def resolve_cluster_from_comment(comment: str) -> str:
     return ""
 
 
+def _target(cluster_name: str) -> str:
+    return f"babylon:{cluster_name}"
+
+
+def _unavailable_error(cluster_name: str) -> Exception | None:
+    """The error to raise, without a request, for a cluster already dead this turn.
+
+    A rejected token, or an API server whose name does not resolve or that
+    refuses the connection, fails the same way on every retry. On the staging
+    pod a babylon sub-agent went on calling clusters after a GUID search had
+    shown all six failing, and one question collected 27 Babylon 401s.
+    """
+    reason = turn_state.dead_reason(_target(cluster_name))
+    if reason is None:
+        return None
+    if reason == turn_state.CREDENTIALS_REJECTED:
+        return PermissionError(
+            f"Babylon cluster '{cluster_name}' rejected Parsec's stored token (HTTP 401) earlier "
+            "in this investigation, so Parsec did not call it again. Retrying will not help; an "
+            "operator has to update its kubeconfig. Report anything that depends on this "
+            "cluster as unverified."
+        )
+    # Each cause needs a different fix, so say which one it was instead of
+    # one sentence covering both.
+    if reason == turn_state.HOST_NOT_FOUND:
+        what = (
+            "did not resolve in DNS earlier in this investigation, so Parsec did not call it "
+            "again: the host name of its API server does not exist. Retrying will not help; an "
+            "operator has to correct or remove this cluster's kubeconfig."
+        )
+    else:  # turn_state.CONNECTION_REFUSED, the only other reason recorded here
+        what = (
+            "refused the connection earlier in this investigation, so Parsec did not call it "
+            "again: nothing is accepting connections at its API server address. Retrying will "
+            "not help; an operator has to bring the API server back or correct its kubeconfig."
+        )
+    return httpx.ConnectError(
+        f"Babylon cluster '{cluster_name}' {what} Report anything that depends on this cluster "
+        "as unverified."
+    )
+
+
+async def _get(cluster_name: str, path: str, params: dict | None = None) -> httpx.Response:
+    """GET from a cluster's API server unless it already proved unusable in this turn."""
+    error = _unavailable_error(cluster_name)
+    if error is not None:
+        raise error
+    client = await _get_client(cluster_name)
+    try:
+        resp = await client.get(path, params=params)
+    except httpx.ConnectError as e:
+        # On staging babydev's API server no longer resolves. Only such final
+        # causes are remembered: a resolver hiccup or a TLS failure is left
+        # for the next call to retry.
+        reason = turn_state.permanent_connect_failure(e)
+        if reason is not None:
+            turn_state.mark_dead(_target(cluster_name), reason)
+        raise
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 401:
+            raise
+        # httpx's own text is a bare "Client error '401 Unauthorized' for url";
+        # say what it means and that another try will not change it.
+        turn_state.mark_dead(_target(cluster_name), turn_state.CREDENTIALS_REJECTED)
+        raise httpx.HTTPStatusError(
+            f"Parsec's configured token for Babylon cluster '{cluster_name}' was rejected "
+            "(HTTP 401) — likely expired or rotated. The cluster is configured; retrying will "
+            "not help, and an operator has to update its kubeconfig.",
+            request=e.request,
+            response=e.response,
+        ) from None
+    return resp
+
+
 async def k8s_get(cluster_name: str, path: str) -> dict:
     """Make a GET request to the Kubernetes API."""
-    client = await _get_client(cluster_name)
-    resp = await client.get(path)
-    resp.raise_for_status()
+    resp = await _get(cluster_name, path)
     return resp.json()
 
 
 async def k8s_get_text(cluster_name: str, path: str, params: dict | None = None) -> str:
     """Make a GET request to the Kubernetes API and return raw text (for pod logs)."""
-    client = await _get_client(cluster_name)
-    resp = await client.get(path, params=params or {})
-    resp.raise_for_status()
+    resp = await _get(cluster_name, path, params or {})
     return resp.text
 
 
@@ -283,9 +357,7 @@ async def k8s_list(
     if limit:
         params["limit"] = limit
 
-    client = await _get_client(cluster_name)
-    resp = await client.get(path, params=params)
-    resp.raise_for_status()
+    resp = await _get(cluster_name, path, params)
     return resp.json()
 
 
@@ -303,9 +375,7 @@ async def k8s_get_resource(
     else:
         path = f"/api/{version}/namespaces/{namespace}/{plural}/{name}"
 
-    client = await _get_client(cluster_name)
-    resp = await client.get(path)
-    resp.raise_for_status()
+    resp = await _get(cluster_name, path)
     return resp.json()
 
 
@@ -316,20 +386,71 @@ async def k8s_list_cluster_wide(
     plural: str,
     label_selector: str = "",
     limit: int = 0,
+    field_selector: str = "",
 ) -> dict:
-    """List custom resources across all namespaces (cluster-wide)."""
+    """List custom resources across all namespaces (cluster-wide).
+
+    Unbounded on a production Babylon cluster this is thousands of objects in
+    one response. Prefer ``field_selector`` (``metadata.name=<name>`` works on
+    custom resources) for a lookup by name, and :func:`k8s_iter_cluster_wide`
+    when every object has to be examined.
+    """
     path = f"/apis/{group}/{version}/{plural}"
 
     params: dict[str, str | int] = {}
     if label_selector:
         params["labelSelector"] = label_selector
+    if field_selector:
+        params["fieldSelector"] = field_selector
     if limit:
         params["limit"] = limit
 
-    client = await _get_client(cluster_name)
-    resp = await client.get(path, params=params)
-    resp.raise_for_status()
+    resp = await _get(cluster_name, path, params)
     return resp.json()
+
+
+#: Objects per page for :func:`k8s_iter_cluster_wide`. Small enough that one
+#: page parses quickly on the event loop; large enough to keep round trips low.
+LIST_PAGE_SIZE = 250
+
+
+async def k8s_iter_cluster_wide(
+    cluster_name: str,
+    group: str,
+    version: str,
+    plural: str,
+    label_selector: str = "",
+    page_size: int = 0,
+    max_items: int = 0,
+) -> AsyncIterator[dict]:
+    """Yield custom resources across all namespaces, one API page at a time.
+
+    Uses the API server's chunking (``limit`` + ``continue``) so a caller that
+    filters can stop as soon as it has enough, and memory holds one page rather
+    than the whole cluster. The unpaged list of every AnarchySubject on
+    babylon prod blocked the event loop long enough to fail three liveness
+    probes in a row, and the kubelet restarted the pod mid-investigation.
+    ``max_items`` bounds how many objects are examined in total (0 = all);
+    ``page_size`` 0 means :data:`LIST_PAGE_SIZE`.
+    """
+    path = f"/apis/{group}/{version}/{plural}"
+    params: dict[str, str | int] = {"limit": page_size or LIST_PAGE_SIZE}
+    if label_selector:
+        params["labelSelector"] = label_selector
+
+    seen = 0
+    while True:
+        resp = await _get(cluster_name, path, params)
+        page = resp.json()
+        for item in page.get("items", []):
+            yield item
+            seen += 1
+            if max_items and seen >= max_items:
+                return
+        token = (page.get("metadata") or {}).get("continue")
+        if not token:
+            return
+        params["continue"] = token
 
 
 async def close_clients() -> None:

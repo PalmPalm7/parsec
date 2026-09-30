@@ -2,7 +2,8 @@
 
 Each agent type has a domain-specific prompt file. Sub-agents (cost, triage,
 security) get shared_context.md prepended. The orchestrator has its own
-standalone prompt. Learnings from data/agent_learnings.md are appended to all.
+standalone prompt. db_pitfalls.md and learnings from data/agent_learnings.md are
+appended to all.
 """
 
 import logging
@@ -15,8 +16,8 @@ _BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 _LEARNINGS_PATH = os.path.join(_BASE_DIR, "data", "agent_learnings.md")
 _PROMPTS_DIR = os.path.join(_BASE_DIR, "config", "prompts")
 
-# Cache: {agent_type: (prompt_str, shared_mtime, domain_mtime, learnings_mtime)}
-_agent_prompt_cache: dict[str, tuple[str, float, float, float]] = {}
+# Cache: {agent_type: (prompt_str, shared_mtime, domain_mtime, pitfalls_mtime, learnings_mtime)}
+_agent_prompt_cache: dict[str, tuple[str, float, float, float, float]] = {}
 
 # Agent type → prompt file mapping
 _AGENT_PROMPT_FILES: dict[str, str] = {
@@ -30,6 +31,9 @@ _AGENT_PROMPT_FILES: dict[str, str] = {
 }
 
 _SHARED_CONTEXT_PATH = os.path.join(_PROMPTS_DIR, "shared_context.md")
+# The orchestrator writes SQL too, so the column pitfalls cannot live in
+# shared_context.md, which only sub-agents get.
+_DB_PITFALLS_PATH = os.path.join(_PROMPTS_DIR, "db_pitfalls.md")
 
 
 def _get_mtime(path: str) -> float:
@@ -77,6 +81,7 @@ def get_prompt_files(agent_type: str) -> list[str]:
     domain_path = _AGENT_PROMPT_FILES.get(agent_type)
     if domain_path:
         files.append(os.path.basename(domain_path))
+        files.append(os.path.basename(_DB_PITFALLS_PATH))
 
     # Agent learnings if present
     if _get_mtime(_LEARNINGS_PATH) > 0:
@@ -90,9 +95,9 @@ def get_agent_prompt(agent_type: str) -> str:
 
     For the orchestrator, returns the orchestrator prompt (no shared context since
     it has its own complete prompt). For sub-agents (cost, triage, security),
-    returns shared_context.md + the domain prompt.
+    returns shared_context.md + the domain prompt. Both then get db_pitfalls.md.
 
-    Hot-reloads when either source file changes (checked via mtime).
+    Hot-reloads when any source file changes (checked via mtime).
     """
     domain_path = _AGENT_PROMPT_FILES.get(agent_type)
     if not domain_path:
@@ -101,17 +106,13 @@ def get_agent_prompt(agent_type: str) -> str:
 
     shared_mtime = _get_mtime(_SHARED_CONTEXT_PATH)
     domain_mtime = _get_mtime(domain_path)
+    pitfalls_mtime = _get_mtime(_DB_PITFALLS_PATH)
     learnings_mtime = _get_mtime(_LEARNINGS_PATH)
+    mtimes = (shared_mtime, domain_mtime, pitfalls_mtime, learnings_mtime)
 
     cached = _agent_prompt_cache.get(agent_type)
-    if cached:
-        cached_prompt, cached_shared_mt, cached_domain_mt, cached_learn_mt = cached
-        if (
-            cached_shared_mt == shared_mtime
-            and cached_domain_mt == domain_mtime
-            and cached_learn_mt == learnings_mtime
-        ):
-            return cached_prompt
+    if cached and cached[1:] == mtimes:
+        return cached[0]
 
     if agent_type == "orchestrator":
         prompt = _read_file(domain_path)
@@ -119,6 +120,10 @@ def get_agent_prompt(agent_type: str) -> str:
         shared = _read_file(_SHARED_CONTEXT_PATH)
         domain = _read_file(domain_path)
         prompt = f"{shared}\n\n{domain}"
+
+    pitfalls = _read_file(_DB_PITFALLS_PATH)
+    if pitfalls:
+        prompt += "\n\n" + pitfalls
 
     # Inject MCP server instructions (schema reference, JOIN patterns, pitfalls)
     from src.connections.reporting_mcp import get_server_instructions
@@ -131,7 +136,7 @@ def get_agent_prompt(agent_type: str) -> str:
     if learnings:
         prompt += "\n\n" + learnings
 
-    _agent_prompt_cache[agent_type] = (prompt, shared_mtime, domain_mtime, learnings_mtime)
+    _agent_prompt_cache[agent_type] = (prompt, *mtimes)
     logger.info(
         "Agent prompt loaded for %s (%d chars, shared=%s)",
         agent_type,

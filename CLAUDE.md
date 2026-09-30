@@ -68,7 +68,8 @@ config/
     security_agent.md        # Security investigation agent
     ocpv_agent.md            # OCPV cluster inspection agent
     icinga_agent.md          # Icinga monitoring investigation agent
-    shared_context.md        # Shared context prepended to all agent prompts
+    shared_context.md        # Shared context prepended to all sub-agent prompts
+    db_pitfalls.md           # Provisions-DB schema pitfalls, appended to every prompt (orchestrator too)
 data/
   ec2_pricing.json           # Static EC2 pricing cache (checked into git)
 scripts/
@@ -247,7 +248,7 @@ with the same message — do NOT amend the previous commit (the failed commit ne
 - **Dockerfile**: Do NOT use `ENTRYPOINT []` — CRI-O on OpenShift requires the S2I base image's `container-entrypoint`. Do NOT hardcode PATH — use `$PATH` to inherit base image paths.
 - **Claude backend**: Supports direct API, Vertex AI, AWS Bedrock, and LiteLLM proxy. Both dev and prod route through LiteMaaS. Per-component model/backend overrides available via `anthropic.overrides.<component>` in config.
 - **Sub-agent architecture**: Orchestrator classifies queries and dispatches to domain sub-agents (cost, aap2, babylon, security, ocpv, icinga). Fast-path classifier skips LLM call for obvious single-domain queries. Per-agent prompts in `config/prompts/`.
-- **Reporting MCP**: Provision DB access goes through a Reporting MCP server via Streamable HTTP (`src/connections/reporting_mcp.py`). Tool schemas are dynamically discovered at startup and prefixed with `db_`. The `reporting_mcp.mcp_url` config is required. Health readiness probe checks cached init state — does NOT make live MCP calls.
+- **Reporting MCP**: Provision DB access goes through a Reporting MCP server via Streamable HTTP (`src/connections/reporting_mcp.py`). Tool schemas are dynamically discovered at startup and prefixed with `db_`. The `reporting_mcp.mcp_url` config is required. Health readiness probe reads cached init state and answers **503** when the Reporting MCP is not initialized; a not-ready probe starts at most one background rediscovery every 30 s (`src/routes/health.py`).
 - **GitHub auth**: Push access to `rhpds/parsec` requires a GitHub account with write permissions. Use `gh auth status` to check the current profile.
 - **AWS IAM**: All AWS tools use the `cost-monitor` IAM user with `CostMonitorPolicy`. Cross-account access uses STS AssumeRole with inline session policy for read-only enforcement. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full policy details.
 - **MLflow metrics**: Agent performance metrics (latency, tokens, tool calls, errors, confidence) are logged to an MLflow tracking server in the `mlflow` namespace via async fire-and-forget background tasks. Conditional on `mlflow.tracking_url` config — disabled when empty. MLflow UI at `https://mlflow.apps.ocpv-infra01.dal12.infra.demo.redhat.com` (OAuth: `rhpds-admins`, `ace-octo-team`). Deployment: `ansible-playbook playbooks/deploy-mlflow.yaml`.

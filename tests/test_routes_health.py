@@ -109,8 +109,9 @@ class TestReadinessEndpoint:
             "src.routes.health.reporting_mcp.get_mcp_tools",
             lambda: [],
         )
+        monkeypatch.setattr("src.routes.health._retry_mcp_discovery", lambda: None)
         resp = client.get("/api/health/ready")
-        assert resp.status_code == 200
+        assert resp.status_code == 503
         data = resp.json()
         assert data["status"] == "not_ready"
         assert data["db"] == "reporting_mcp_not_initialized"

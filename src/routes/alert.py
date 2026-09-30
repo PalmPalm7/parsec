@@ -1,10 +1,11 @@
 """Alert investigation endpoint — POST /api/alert/investigate."""
 
+import hmac
 import logging
 import time
 from typing import Annotated
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
 from src.agent.orchestrator import run_alert_investigation
@@ -34,21 +35,20 @@ class AlertResponse(BaseModel):
     duration_seconds: float
 
 
-@router.post(
-    "/investigate",
-    response_model=AlertResponse,
-    responses={401: {"description": "Unauthorized"}, 503: {"description": "Service Unavailable"}},
-)
-async def investigate_alert(
-    body: AlertRequest,
-    x_api_key: Annotated[str | None, Header()] = None,
-):
-    """Investigate an alert and return a structured verdict.
+async def _require_api_key(x_api_key: Annotated[str | None, Header()] = None) -> None:
+    """Reject a caller without the configured X-API-Key.
 
-    Authenticated via X-API-Key header (not OAuth — called by Lambda).
+    A dependency rather than a check in the handler body because FastAPI runs
+    dependencies before it validates the request body: done in the handler, an
+    unauthenticated caller with a bad body got a 422 that spelled out the
+    request schema instead of a 401. compare_digest keeps the comparison
+    constant-time; both sides are bytes because it refuses non-ASCII str.
+
+    The configured key is coerced to str first: Dynaconf casts an all-digit
+    PARSEC_ALERT_API_KEY to an int, which has no .encode(), so every keyed
+    request would be a 500 instead of an answer.
     """
-    cfg = get_config()
-    configured_key = cfg.get("alert_api_key", "")
+    configured_key = str(get_config().get("alert_api_key", "") or "")
 
     if not configured_key:
         raise HTTPException(
@@ -56,9 +56,21 @@ async def investigate_alert(
             detail="Alert investigation endpoint is not configured (alert_api_key is empty)",
         )
 
-    if not x_api_key or x_api_key != configured_key:
+    if not x_api_key or not hmac.compare_digest(x_api_key.encode(), configured_key.encode()):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
+
+@router.post(
+    "/investigate",
+    response_model=AlertResponse,
+    responses={401: {"description": "Unauthorized"}, 503: {"description": "Service Unavailable"}},
+    dependencies=[Depends(_require_api_key)],
+)
+async def investigate_alert(body: AlertRequest):
+    """Investigate an alert and return a structured verdict.
+
+    Authenticated via X-API-Key header (not OAuth — called by Lambda).
+    """
     logger.info(
         "Alert investigation request: type=%s account=%s",
         body.alert_type,

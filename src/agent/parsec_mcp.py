@@ -36,6 +36,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,29 @@ SERVER_NAME = "parsec"
 #: context at creation, so a ``.set()`` afterwards is invisible to it.
 sse_sink: ContextVar[Callable[[str], Awaitable[None]] | None] = ContextVar(
     "parsec_mcp_sse_sink", default=None
+)
+
+
+@dataclass
+class ToolStats:
+    """Tool calls made through the bridge during one turn, and how many failed."""
+
+    calls: int = 0
+    errors: int = 0
+
+
+#: Per-turn tool accounting, set by the caller alongside :data:`sse_sink` (and
+#: with the same before-``create_task`` rule). The SDK runs the tool loop itself,
+#: so this bridge is the only place Parsec sees each call — without it the SDK
+#: path reported ``tool_calls=0`` to MLflow for every turn, however many it made.
+tool_stats: ContextVar[ToolStats | None] = ContextVar("parsec_mcp_tool_stats", default=None)
+
+#: The conversation the current turn belongs to, set by the caller alongside
+#: :data:`tool_stats` (and with the same before-``create_task`` rule). A handler
+#: has no other way to tell which conversation, and so which user, a call came
+#: from; with overlapping requests, log adjacency cannot tell either.
+turn_conversation_id: ContextVar[str | None] = ContextVar(
+    "parsec_mcp_conversation_id", default=None
 )
 
 #: The only state-mutating surface Parsec exposes. These are enum values of the
@@ -133,15 +157,24 @@ def _make_handler(name: str, allow_writes: bool) -> Callable[[dict], Awaitable[d
     """
 
     async def _handler(args: dict, _name: str = name) -> dict:
+        stats = tool_stats.get()
         refusal = _refuse_write(_name, args, allow_writes)
         if refusal is not None:
+            if stats is not None:
+                stats.calls += 1
+                stats.errors += 1
             return refusal
+        _log_permitted_write(_name, args)
 
         sink = sse_sink.get()
         if sink is not None:
             await _emit(sink, "tool_start", _name, args)
 
         result = await _dispatch_cached(_name, args)
+        if stats is not None:
+            stats.calls += 1
+            if isinstance(result, dict) and "error" in result:
+                stats.errors += 1
 
         if sink is not None:
             await _emit(sink, "tool_result", _name, result)
@@ -175,6 +208,43 @@ def _refuse_write(name: str, args: dict, allow_writes: bool) -> dict | None:
         ],
         "is_error": True,
     }
+
+
+def _log_permitted_write(name: str, args: dict) -> None:
+    """Leave a trace of every Icinga write the SDK bridge lets through.
+
+    Refusals were logged and permitted writes were not, so a deployment with
+    writes switched on changed live monitoring state without a line in the
+    log. parsec-dev ran exactly that way, enabled by a hand-set env var.
+
+    The line carries the conversation id; the route's "Query from user=…
+    conversation_id=…" line maps that to the person who asked. Every value is
+    model or request input, so each is ``%r``-quoted: a raw newline in any of
+    them would otherwise print a second, forged audit line.
+
+    SDK bridge only. The legacy runtime sends Icinga calls through
+    ``orchestrator._execute_tool`` straight to ``tools.icinga.query_icinga``,
+    which has neither this audit nor the write gate in :func:`_refuse_write`;
+    that path is out of scope here.
+    """
+    if name != "query_icinga":
+        return
+    action = str(args.get("action", ""))
+    if action not in WRITE_ACTIONS:
+        return
+    # Name what query_icinga will actually change: only remove_comment acts on
+    # a comment, every other write on object_type/name. Keying on whether a
+    # comment_name was sent logged a Host acknowledge against a stray comment.
+    if action == "remove_comment":
+        target = f"comment {args.get('comment_name') or '?'!r}"
+    else:
+        target = f"{args.get('object_type') or '?'!r} {args.get('name') or '?'!r}"
+    logger.warning(
+        "Permitted Icinga write action %r on %s (conversation_id=%r)",
+        action,
+        target,
+        turn_conversation_id.get() or "-",
+    )
 
 
 async def _dispatch_cached(name: str, args: dict) -> dict:

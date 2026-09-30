@@ -76,30 +76,6 @@ class QueryRequest(BaseModel):
     session_id: str | None = None
 
 
-def _log_identity_debug(request: Request) -> None:
-    """Log all identity-related headers from the OAuth proxy / Keycloak.
-
-    TODO: Remove this once the allowed_users list is finalized.
-    """
-    identity_headers = {}
-    for header_name, header_value in request.headers.items():
-        lower = header_name.lower()
-        if lower.startswith(("x-forwarded-", "x-auth-", "x-remote-")):
-            identity_headers[header_name] = header_value
-
-    if identity_headers:
-        logger.info("=== SSO DEBUG: Identity headers ===")
-        for name, value in sorted(identity_headers.items()):
-            # Don't log full access tokens, just note their presence
-            if "token" in name.lower() or "authorization" in name.lower():
-                logger.info("  %s: [present, %d chars]", name, len(value))
-            else:
-                logger.info("  %s: %s", name, value)
-        logger.info("=== END SSO DEBUG ===")
-    else:
-        logger.info("=== SSO DEBUG: No identity headers found in request ===")
-
-
 def _parse_csv_set(value: str) -> set[str]:
     """Parse a comma-separated string into a lowercase set, skipping blanks."""
     return {item.strip().lower() for item in value.split(",") if item.strip()}
@@ -157,8 +133,6 @@ async def _check_user_allowed(request: Request, user: str | None) -> None:
     not from proxy headers. Access is granted if the user belongs to any
     allowed group OR is in the allowed_users email list.
     """
-    _log_identity_debug(request)
-
     cfg = get_config()
     allowed_groups_str = cfg.auth.get("allowed_groups", "")
 

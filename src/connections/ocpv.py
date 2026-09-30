@@ -5,6 +5,7 @@ import logging
 import os
 import ssl
 from base64 import b64decode
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -240,6 +241,43 @@ async def k8s_list_cluster(
     resp = await client.get(path, params=params)
     resp.raise_for_status()
     return resp.json()
+
+
+#: Objects per page for :func:`k8s_iter_cluster` — the size Babylon's paged
+#: listing uses: one page parses quickly on the event loop, round trips stay few.
+LIST_PAGE_SIZE = 250
+
+
+async def k8s_iter_cluster(
+    cluster_name: str,
+    group: str,
+    version: str,
+    plural: str,
+    page_size: int = 0,
+) -> AsyncIterator[dict]:
+    """Yield cluster-scoped resources one API page at a time.
+
+    Uses the API server's chunking (``limit`` + ``continue``), so memory holds
+    one page rather than the whole list and the event loop gets control back
+    between pages. An unpaged cluster-wide list on babylon prod blocked the
+    event loop past three liveness probes and the kubelet restarted the pod;
+    PersistentVolumes on an ODF-backed OCPV cluster are the same kind of list.
+    ``page_size`` 0 means :data:`LIST_PAGE_SIZE`.
+    """
+    path = f"/apis/{group}/{version}/{plural}" if group else f"/api/{version}/{plural}"
+    params: dict[str, str | int] = {"limit": page_size or LIST_PAGE_SIZE}
+
+    client = await _get_client(cluster_name)
+    while True:
+        resp = await client.get(path, params=params)
+        resp.raise_for_status()
+        page = resp.json()
+        for item in page.get("items", []):
+            yield item
+        token = (page.get("metadata") or {}).get("continue")
+        if not token:
+            return
+        params["continue"] = token
 
 
 async def close_clients() -> None:

@@ -198,6 +198,7 @@ agent:
     # granted here explicitly.
     env: {}
     timeout: 300         # per-call wall-clock ceiling (seconds); null/0 disables
+    turn_timeout: 900    # whole orchestrator turn, sub-agents included; null/0 disables
     # cli_path: ""       # absolute path to the `claude` binary. Empty leaves the
     #                    # choice to the SDK, whose _find_cli() prefers the CLI
     #                    # bundled inside the claude-agent-sdk wheel over the

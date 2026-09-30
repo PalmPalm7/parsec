@@ -1,10 +1,12 @@
 """AAP2 debug API endpoints."""
 
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
+from src.routes.query import _check_user_allowed
 from src.tools.aap2_debug import (
     fetch_correlation,
     fetch_ee_info,
@@ -19,7 +21,32 @@ from src.tools.aap2_stdout import extract_failing_task
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/debug", tags=["debug"])
+
+async def _require_allowed_user(
+    request: Request,
+    x_forwarded_user: Annotated[str | None, Header()] = None,
+    x_forwarded_email: Annotated[str | None, Header()] = None,
+) -> None:
+    """The same allowed-user gate as every other route.
+
+    These endpoints fetch AAP2 job output with Parsec's own controller
+    credentials, and the oauth-proxy in front admits any user who can log in
+    to the cluster (``-email-domain=*``, no group check) — group membership is
+    enforced here, in the app. Without this dependency anyone with a cluster
+    login could read job logs through Parsec. Router-level, so an endpoint
+    added later cannot forget it.
+    """
+    await _check_user_allowed(request, x_forwarded_email or x_forwarded_user)
+
+
+router = APIRouter(
+    prefix="/api/debug", tags=["debug"], dependencies=[Depends(_require_allowed_user)]
+)
+
+#: A controller rejecting *Parsec's* credentials is a server-side fault, not the
+#: caller's: 401 told the browser the user was unauthenticated, and the two
+#: phase endpoints surfaced the same condition as an opaque 500.
+_UPSTREAM_AUTH_STATUS = 502
 
 
 class DiagnoseRequest(BaseModel):
@@ -87,9 +114,10 @@ async def _diagnose_error_job(cluster_name: str, metadata: dict, result: dict) -
     "/diagnose",
     responses={
         400: {"description": "Bad Request"},
-        401: {"description": "Unauthorized"},
+        403: {"description": "Forbidden"},
         404: {"description": "Not Found"},
         500: {"description": "Internal Server Error"},
+        502: {"description": "AAP2 controller rejected Parsec's credentials"},
     },
 )
 async def diagnose(body: DiagnoseRequest):
@@ -125,7 +153,7 @@ async def diagnose(body: DiagnoseRequest):
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except PermissionError as e:
-        raise HTTPException(status_code=401, detail=str(e)) from e
+        raise HTTPException(status_code=_UPSTREAM_AUTH_STATUS, detail=str(e)) from e
     except Exception as e:
         logger.exception("Diagnosis failed")
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -133,7 +161,12 @@ async def diagnose(body: DiagnoseRequest):
 
 @router.post(
     "/correlation",
-    responses={400: {"description": "Bad Request"}, 500: {"description": "Internal Server Error"}},
+    responses={
+        400: {"description": "Bad Request"},
+        403: {"description": "Forbidden"},
+        500: {"description": "Internal Server Error"},
+        502: {"description": "AAP2 controller rejected Parsec's credentials"},
+    },
 )
 async def correlation(body: CorrelationRequest):
     """Fetch correlation data for a job (Phase 4)."""
@@ -143,6 +176,8 @@ async def correlation(body: CorrelationRequest):
         return await fetch_correlation(cluster_name, body.job_id, body.job_template)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    except PermissionError as e:
+        raise HTTPException(status_code=_UPSTREAM_AUTH_STATUS, detail=str(e)) from e
     except Exception as e:
         logger.exception("Correlation fetch failed")
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -150,7 +185,12 @@ async def correlation(body: CorrelationRequest):
 
 @router.post(
     "/ee",
-    responses={400: {"description": "Bad Request"}, 500: {"description": "Internal Server Error"}},
+    responses={
+        400: {"description": "Bad Request"},
+        403: {"description": "Forbidden"},
+        500: {"description": "Internal Server Error"},
+        502: {"description": "AAP2 controller rejected Parsec's credentials"},
+    },
 )
 async def ee_info(body: EERequest):
     """Fetch execution environment info (Phase 5)."""
@@ -160,6 +200,8 @@ async def ee_info(body: EERequest):
         return await fetch_ee_info(cluster_name, body.ee_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    except PermissionError as e:
+        raise HTTPException(status_code=_UPSTREAM_AUTH_STATUS, detail=str(e)) from e
     except Exception as e:
         logger.exception("EE fetch failed")
         raise HTTPException(status_code=500, detail=str(e)) from e
