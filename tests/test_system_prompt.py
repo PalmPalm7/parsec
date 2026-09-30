@@ -70,3 +70,22 @@ def test_editing_the_pitfalls_invalidates_the_cache(
     prompt = get_agent_prompt("orchestrator")
     assert "Pitfalls v2" in prompt
     assert "Pitfalls v1" not in prompt
+
+
+def _section(prompt: str, heading: str, next_heading: str) -> str:
+    start = prompt.index(heading)
+    return prompt[start : prompt.index(next_heading, start)]
+
+
+def test_aap2_flow_picks_the_job_for_the_failed_action() -> None:
+    # provisions.tower_job_id is the provision job in 1274 of 1274 rows and a
+    # stop/start/destroy job in 0 of 1633: sent there for a destroy failure, the agent
+    # read the provision job — which had usually succeeded — and was told to stop.
+    flow = _section(get_agent_prompt("aap2"), "### Investigation Flow", "### Available")
+
+    assert "No Babylon call is needed" not in flow
+    assert "WHERE provision_uuid = '<uuid>' AND action = '<action>'" in flow
+    assert 'ORDER BY "startTimestamp" DESC LIMIT 1' in flow
+    # The per-action DB lookup comes before any Babylon call.
+    assert flow.index("FROM provision_job") < flow.index("list_anarchy_subjects")
+    assert "`tower_jobs.<action>`" in flow

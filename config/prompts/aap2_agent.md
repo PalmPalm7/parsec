@@ -54,16 +54,27 @@ The `query_aap2` tool queries AAP2 controllers for job metadata and execution ev
 ### Investigation Flow
 
 1. Get the provision row from the user's question or the provision DB — with the GUID,
-   select `tower_job_id`, `tower_job_url`, `anarchy_subject_name` and
-   `anarchy_subject_namespace`.
-2. Find the job from the cheapest source that has it:
-   - **The row has `tower_job_id` / `tower_job_url`** → call `query_aap2` with
-     `get_job_log` directly: `tower_job_id` as job_id, the hostname in `tower_job_url`
-     as controller. No Babylon call is needed.
-   - **Otherwise** → `query_babylon_catalog` `list_anarchy_subjects` with the guid and
-     `namespace` set to `anarchy_subject_namespace`, which lists that one namespace
-     instead of the whole cluster. Read `tower_jobs` from the AnarchySubject — it
-     contains the controller hostname and job ID — and call `get_job_log` with
+   select `uuid`, `tower_job_id`, `tower_job_url`, `anarchy_subject_name` and
+   `anarchy_subject_namespace`. Note which action failed — `provision`, `stop`,
+   `start` or `destroy` — from the question or from a state such as `destroy-failed`.
+2. Find the job **for that action**, from the cheapest source that has it:
+   - **`provision` failed and the row has `tower_job_id` / `tower_job_url`** → call
+     `query_aap2` with `get_job_log` directly: `tower_job_id` as job_id, the hostname
+     in `tower_job_url` as controller. These two columns always hold the provision
+     job — never the stop, start or destroy job, which may well have succeeded.
+   - **Any other action** (or a provision row without those columns) → look the job
+     up in `provision_job`, one row per action run, where `<uuid>` is the row's `uuid`:
+     ```sql
+     SELECT "deployerJob", "towerHost", "jobStatus" FROM provision_job
+     WHERE provision_uuid = '<uuid>' AND action = '<action>'
+     ORDER BY "startTimestamp" DESC LIMIT 1
+     ```
+     Call `get_job_log` with `"towerHost"` as controller and `"deployerJob"` as job_id.
+   - **Only when the provision DB has no job for that action** →
+     `query_babylon_catalog` `list_anarchy_subjects` with the guid and `namespace` set
+     to `anarchy_subject_namespace`, which lists that one namespace instead of the
+     whole cluster. Read `tower_jobs.<action>` from the AnarchySubject — it holds the
+     controller hostname and job ID for each action — and call `get_job_log` with
      `towerHost` as controller and `deployerJob` as job_id.
    - **Last resort** → `list_anarchy_subjects` with the guid alone. That scans every
      AnarchySubject on every Babylon cluster in turn; use it only when the provision
@@ -113,7 +124,8 @@ When AAP2 job IDs are missing from `tower_job_log`:
 
 1. Call `db_describe_table('tower_job_log')` — the job column is `"deployerJob"`
    (camelCase, so double-quote it), not `job_id`
-2. Search `tower_job_log` by `"deployerJob"`
+2. Search `tower_job_log` by `"deployerJob"`, then `provision_job` by `"deployerJob"` —
+   only `provision_job` has a `provision_uuid` that leads back to the provision
 3. Search `lifecycle_log` for recent provisions referencing the job in comments
 4. If still not found, the job may be too recent for DB ingestion or on a different
    controller — call `query_aap2` with `get_job_log` directly on the resolved controller
