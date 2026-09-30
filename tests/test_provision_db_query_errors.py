@@ -59,7 +59,16 @@ def test_undefined_column_is_an_error_with_a_hint():
     # The SQL echo and the docs link are noise the model already has.
     assert "[SQL:" not in result["error"] and "sqlalche.me" not in result["error"]
     assert "db_describe_table" in result["hint"]
-    assert "u.id = p.user_id" in result["hint"] and "ordered_by" in result["hint"]
+
+
+def test_undefined_column_hint_states_what_ordered_by_really_holds():
+    # The live rows hold the requester's email (dev q03/q04/q13, staging q10), or NULL.
+    hint = _run(_UNDEFINED_COLUMN)["hint"]
+    assert (
+        "p.ordered_by is the requester's email (FK to users.email; may be NULL). "
+        "p.user_id → users is the assigned user and can differ."
+    ) in hint
+    assert "requester's name" not in hint
 
 
 def test_postgres_hint_line_survives_and_the_sql_echo_does_not():

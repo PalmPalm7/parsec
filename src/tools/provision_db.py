@@ -31,14 +31,24 @@ _QUERY_ERROR_PREFIX = "Query error:"
 _SQL_ECHO_START = "[SQL:"
 _DOCS_LINK_START = "(Background on this "
 
+#: What provisions.ordered_by holds: every live row that selected it showed the
+#: requester's email address or NULL, not the requester's name.
+_ORDERED_BY_FACT = (
+    "p.ordered_by is the requester's email (FK to users.email; may be NULL). "
+    "p.user_id → users is the assigned user and can differ."
+)
+
 #: What to do next for the database errors the agents actually hit, keyed by the
 #: asyncpg exception class named in the error text.
 _QUERY_ERROR_HINTS = {
+    # The tool cannot tell which table a missing column was meant for (the error
+    # names only an alias such as "p." or "tl."), so the provisions part is
+    # always sent and says it is about provisions. Most live UndefinedColumnErrors
+    # were p.user_email.
     "UndefinedColumnError": (
         "A column in this query does not exist. Call db_describe_table on the table "
         "before retrying instead of guessing column names. provisions has no user_email "
-        "or email column: JOIN users u ON u.id = p.user_id for the email; the "
-        "requester's name is p.ordered_by."
+        f"or email column. {_ORDERED_BY_FACT}"
     ),
     "QueryCanceledError": (
         "The query hit the database statement timeout. Run the indexed exact match "
