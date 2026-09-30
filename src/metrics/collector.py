@@ -94,6 +94,11 @@ class MetricsCollector:
     # means "estimate from token counts" — see :meth:`resolved_cost_usd`.
     cost_usd: float = 0.0
     status: str = ""
+    # False when the runtime never reported usage for the turn: an SDK turn cut
+    # off before its ResultMessage (client gone, turn timeout, CLI failure). The
+    # zeros above then mean "not reported", not "free", so the token and cost
+    # figures are left out of MLflow and shown as "-" on the usage line.
+    usage_known: bool = True
 
     def start_timer(self) -> None:
         self._start_time = time.monotonic()
@@ -148,6 +153,10 @@ class MetricsCollector:
         self.output_tokens += output_tokens
         self.cache_creation_tokens += cache_creation_tokens
         self.cache_read_tokens += cache_read_tokens
+
+    def mark_usage_unknown(self) -> None:
+        """The turn ended without the runtime reporting its tokens or cost."""
+        self.usage_known = False
 
     def record_model(self, model: str) -> None:
         self.model = model
@@ -206,18 +215,25 @@ class MetricsCollector:
         }
 
     def to_metrics(self) -> dict[str, float]:
-        return {
+        metrics = {
             "total_latency_ms": self.total_latency_ms,
             "sub_agent_latency_ms": self.sub_agent_latency_ms,
             "tool_calls": float(self.tool_calls),
             "tool_errors": float(self.tool_errors),
             "rounds_used": float(self.rounds_used),
-            "input_tokens": float(self.input_tokens),
-            "output_tokens": float(self.output_tokens),
-            "cache_creation_tokens": float(self.cache_creation_tokens),
-            "cache_read_tokens": float(self.cache_read_tokens),
-            "cost_usd": self.resolved_cost_usd(),
         }
+        if self.usage_known:
+            # Left out rather than logged as 0 when unknown: a turn that ran for
+            # minutes before the client went away would otherwise log $0.00 and
+            # drag down every $-per-turn and token average it is part of.
+            metrics |= {
+                "input_tokens": float(self.input_tokens),
+                "output_tokens": float(self.output_tokens),
+                "cache_creation_tokens": float(self.cache_creation_tokens),
+                "cache_read_tokens": float(self.cache_read_tokens),
+                "cost_usd": self.resolved_cost_usd(),
+            }
+        return metrics
 
     def log_summary(self) -> None:
         """Emit one line of usage to the app log.
@@ -237,23 +253,39 @@ class MetricsCollector:
         from the e2e run had to be paired with questions by log adjacency, and
         an overlapping request made that ambiguous. ``version`` ties the line to
         the image that produced it.
+
+        When the usage is unknown (see ``usage_known``) the token, cache-hit and
+        cost fields read "-", so no reader can take them for a free turn; the
+        run_cache_test.py regex then skips the line instead of counting zeros.
         """
-        cached_in = self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
-        hit_pct = (self.cache_read_tokens / cached_in * 100) if cached_in else 0.0
+        if self.usage_known:
+            cached_in = self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
+            hit_pct = (self.cache_read_tokens / cached_in * 100) if cached_in else 0.0
+            counts = (
+                str(self.input_tokens),
+                str(self.output_tokens),
+                str(self.cache_read_tokens),
+                str(self.cache_creation_tokens),
+                f"{hit_pct:.1f}%",
+                f"{self.resolved_cost_usd():.4f}",
+            )
+        else:
+            counts = ("-",) * 6
+        n_in, n_out, n_read, n_write, hit, cost = counts
         logger.info(
-            "usage runtime=%s agent=%s in=%d out=%d cache_read=%d cache_write=%d "
-            "cache_hit=%.1f%% tools=%d errors=%d cost_usd=%.4f latency_ms=%.0f "
+            "usage runtime=%s agent=%s in=%s out=%s cache_read=%s cache_write=%s "
+            "cache_hit=%s tools=%d errors=%d cost_usd=%s latency_ms=%.0f "
             "conversation_id=%s status=%s version=%s sub_agents=%s",
             self.runtime or "-",
             self.agent_type or "-",
-            self.input_tokens,
-            self.output_tokens,
-            self.cache_read_tokens,
-            self.cache_creation_tokens,
-            hit_pct,
+            n_in,
+            n_out,
+            n_read,
+            n_write,
+            hit,
             self.tool_calls,
             self.tool_errors,
-            self.resolved_cost_usd(),
+            cost,
             self.total_latency_ms,
             self.conversation_id or "-",
             self.status or "-",

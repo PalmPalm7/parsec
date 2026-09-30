@@ -284,8 +284,12 @@ def sdk_turn(monkeypatch):
     monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", _Client)
     flushed = _flush_into(monkeypatch)
 
-    def run(scenario, *, finish_turn: bool) -> tuple[MetricsCollector, list[MetricsCollector]]:
+    def run(
+        scenario, *, finish_turn: bool, sdk_cfg: dict | None = None
+    ) -> tuple[MetricsCollector, list[MetricsCollector]]:
         _Client.finish_turn = finish_turn
+        cfg = {"agent": {"sdk": sdk_cfg or {}}}
+        monkeypatch.setattr(src.config, "get_config", lambda: cfg)
         gen = orch.run_agent_via_sdk("why did job 172261 fail?", [], conversation_id="conv-q13")
         asyncio.run(asyncio.wait_for(scenario(gen), timeout=10))
         (collector,) = made
@@ -348,3 +352,61 @@ def test_cancelled_stream_still_records_the_turn_as_aborted(sdk_turn):
     assert flushed == [c]
     assert c.status == "aborted"
     assert c.tool_calls == 1
+
+
+# ------------------------------------------------------------ unknown usage
+
+#: What the CLI reports only in its ResultMessage.
+_USAGE_METRICS = {
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_tokens",
+    "cache_read_tokens",
+    "cost_usd",
+}
+_USAGE_FIELDS = ("in", "out", "cache_read", "cache_write", "cache_hit", "cost_usd")
+
+
+async def _close_after_first_text(gen):
+    async for event in gen:
+        if event.startswith("event: text"):
+            break
+    await gen.aclose()
+
+
+def test_turn_cut_off_before_its_result_has_unknown_usage_not_zero(sdk_turn, caplog):
+    """No ResultMessage arrived, so the CLI never said what the turn used; $0.00
+    and 0 tokens would count a turn that may have run for minutes as free."""
+    c, flushed = sdk_turn(_close_after_first_text, finish_turn=False)
+
+    assert flushed == [c] and c.status == "aborted"
+    metrics = c.to_metrics()
+    assert _USAGE_METRICS.isdisjoint(metrics), "unknown, so left out of MLflow"
+    assert metrics["tool_calls"] == 1, "what is known is still recorded"
+    line = _usage_line(caplog, c)
+    assert [_fields(line)[k] for k in _USAGE_FIELDS] == ["-"] * len(_USAGE_FIELDS)
+    assert not _RUN_CACHE_TEST_USAGE.search(line), "not parsed as a zero-cost turn"
+
+
+def test_turn_timeout_before_the_result_has_unknown_usage(sdk_turn, caplog):
+    async def consume(gen):
+        [e async for e in gen]
+
+    c, flushed = sdk_turn(consume, finish_turn=False, sdk_cfg={"turn_timeout": 0.3})
+
+    assert flushed == [c] and c.status == "error"
+    assert _USAGE_METRICS.isdisjoint(c.to_metrics())
+    line = _usage_line(caplog, c)
+    assert [_fields(line)[k] for k in _USAGE_FIELDS] == ["-"] * len(_USAGE_FIELDS)
+
+
+def test_turn_with_a_result_still_reports_its_usage(sdk_turn, caplog):
+    async def consume(gen):
+        [e async for e in gen]
+
+    c, _ = sdk_turn(consume, finish_turn=True)
+
+    metrics = c.to_metrics()
+    assert metrics["input_tokens"] == 1_710
+    assert metrics["cost_usd"] == pytest.approx(3.9339)
+    assert _RUN_CACHE_TEST_USAGE.search(_usage_line(caplog, c))

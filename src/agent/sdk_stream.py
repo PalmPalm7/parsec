@@ -368,10 +368,17 @@ class SdkEventTranslator:
             return
         self._metrics_recorded = True
         try:
-            collector.record_tokens(**_turn_tokens(self._usage))
-            cost = getattr(self._usage, "total_cost_usd", None)
-            if cost:
-                collector.record_cost(cost)
+            if self._usage is None:
+                # No ResultMessage: the turn was cut off (client gone, turn
+                # timeout, CLI failure) before the CLI reported what it used.
+                # Recording 0 tokens and $0 would log a turn that ran for minutes
+                # as free; the collector leaves the figures out instead.
+                collector.mark_usage_unknown()
+            else:
+                collector.record_tokens(**_turn_tokens(self._usage))
+                cost = getattr(self._usage, "total_cost_usd", None)
+                if cost:
+                    collector.record_cost(cost)
             # The legacy loop sets a turn status; the SDK path left it blank, so
             # failed SDK turns were indistinguishable from successful ones in MLflow.
             collector.status = status or ("error" if self._failure_reason() else "success")
