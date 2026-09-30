@@ -388,7 +388,12 @@ class TestExecuteTool:
             "src.agent.orchestrator._execute_db_tool",
             AsyncMock(return_value=None),
         )
-        tool_input = {"type": "bar", "data": [1, 2, 3]}
+        tool_input = {
+            "chart_type": "bar",
+            "title": "t",
+            "labels": ["a", "b", "c"],
+            "datasets": [{"label": "cost", "data": [1, 2, 3]}],
+        }
         result = await _execute_tool("render_chart", tool_input)
         assert result is tool_input
 

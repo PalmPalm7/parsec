@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 
 from src.config import get_config
-from src.connections.gcp import get_bq_client
+from src.connections.gcp import get_bq_client, get_gcp_init_error
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,11 @@ async def query_gcp_costs(
     """
     bq_client = get_bq_client()
     if bq_client is None:
+        init_error = get_gcp_init_error()
+        if init_error:
+            # Configured but broken (e.g. the credentials file is not mounted): say so,
+            # so the answer points at the deployment rather than at missing config.
+            return {"error": f"GCP BigQuery failed to initialize: {init_error}"}
         return {"error": "GCP BigQuery not configured"}
 
     try:

@@ -119,8 +119,9 @@ The six dimensions below each zoom into one part of this picture.
 ## 6. Injected system prompts
 
 Both runtimes assemble the system prompt the **same way**, via `get_agent_prompt(agent_type)` (`src/agent/system_prompt.py:91`):
-- **Orchestrator** = `orchestrator.md` standalone.
-- **Every sub-agent** = `shared_context.md` (12 KB, the cross-cutting rules) + its domain `*_agent.md`, then the **reporting-DB MCP reference** is appended (`system_prompt.py:124`), then **learnings** (`system_prompt.py:132`). Cached on input mtimes, so it hot-reloads.
+- **Orchestrator** = `orchestrator.md`, then `db_pitfalls.md`.
+- **Every sub-agent** = `shared_context.md` (the cross-cutting rules) + its domain `*_agent.md`, then `db_pitfalls.md`, then the **reporting-DB MCP reference**, then **learnings**. Cached on input mtimes, so it hot-reloads.
+- `db_pitfalls.md` exists because the orchestrator never saw the schema rules that lived in `shared_context.md`: on the 2026-09-30 OpenShift test it guessed `p.user_email` in 7 of 13 questions. It also corrects a wrong fact — `tower_job_log` / `provision_job` use camelCase columns that must be double-quoted (`"deployerJob"`, `"towerHost"`, …).
 - **Legacy injection:** `system = f"{get_agent_prompt(agent_type)}\n\nToday's date is {today}."` → `messages.create(system=…)` (`agents.py:423-426, 464`).
 - **SDK injection:** `_run_via_sdk` loads the **same** `get_agent_prompt(agent_type)` (`runner.py:175`) "so the two paths share prompt content for a fair benchmark," passed as `ClaudeAgentOptions.system_prompt`. Two differences: (a) **no "Today's date" suffix** on the SDK path (a small asymmetry), and (b) it **additionally loads the SKILL.md**.
 - **The Icinga overlap to know about:** on the SDK path the triage workflow is injected *twice* — once in the system prompt (`icinga_agent.md`, talking about `query_icinga`) and once in the skill (`SKILL.md`, talking about `mcp__icinga__*`). The skill is meant to be the authoritative procedural layer for the SDK; the prompt is still injected for benchmark parity. Known redundancy to reconcile before they drift.
@@ -431,3 +432,58 @@ on where `install_root` and `state_path` point: in `playbooks/templates/manifest
 **Image runtime contract.** The Dockerfile's verify step asserts `git`, a writable `$HOME`, Node,
 that the `claude` on `PATH` is the pinned `CLAUDE_CODE_VERSION`, and the seeded `/app/.claude/skills`. Rebasing onto another base image (the
 ubi9-minimal work in #29) must keep all of them, or the image build fails.
+## 15. Live OpenShift test (2026-09-30) — what broke, what changed
+
+Thirteen real production questions (one per sub-agent plus multi-agent, follow-up and GitHub
+cases, taken from the MLflow trace mirror) were run through `/api/query` on **parsec-dev**
+(upstream `main` @ `d98e0e2`) and on the **rh-ace-aiops staging pod**, with per-question memory
+(cgroup), CPU throttling, restarts, tool errors and cost recorded. Harness and raw results live in
+`parsec-ab-benchmark` (`e2e_openshift.py`, `e2e_api_checks.py`, `connector_probe.py`).
+
+**Headline:** dev answered 10/13 — the container was killed three times mid-question (one liveness
+kill, two OOM kills), each time inside a Babylon listing. Staging finished all 13, but 113 of 459
+tool calls failed and three questions cost $6.91 of $9.84, one of them ending with no answer.
+
+| What we saw | Root cause | Fix |
+|---|---|---|
+| dev pod restarted on q06 / q11 / q13 | `list_anarchy_subjects` fetched **every** AnarchySubject on babylon prod in one response, parsed on the event loop, in a 500m / 512Mi pod | Babylon listings page with `limit`/`continue` and stop early; Workshop lookups use `fieldSelector=metadata.name=`; pod sized 1Gi/500m → 3Gi/2 CPU in `common.yml` (CPU now a template var) |
+| a hung CLI would hold the request forever | `agent.sdk.timeout` never applied to the whole-turn path | `agent.sdk.turn_timeout` (default 900 s), per-await, one clear error |
+| usage line `tools=0 errors=0 latency_ms=0` on every SDK turn, sub-agent tokens missing | nothing fed the collector on the SDK path; timer never started; `usage` excludes sub-agents | bridge `ToolStats`, timer, status; tokens from `model_usage`; `conversation_id`/`status`/`version`/`sub_agents` appended to the line; aborted turns recorded, unknown cost left unknown |
+| denied user reached `/api/debug/*` | router had no `_check_user_allowed` (the oauth-proxy admits any cluster login) | router-level dependency; upstream credential failure is a 502 |
+| 7 queries refused as `Forbidden SQL keyword: cluster` | keyword regex ran over string literals | literals/identifiers/comments blanked first; fails closed |
+| 47 AAP2 + 27 Babylon 401s in one question | nothing remembered a dead backend; 401 text read as "not configured" | per-turn breaker (`src/connections/turn_state.py`) for 401 and permanent DNS/refused; honest error text |
+| SQL errors and all-clusters-failed read as success | Reporting-MCP `Query error:` text; Babylon returned `errors[]` beside an empty list | explicit `{"error"}` with Postgres HINT kept; Babylon `incomplete`/`error` |
+| Icinga answers with other hosts' data; ages misread | `A \|\| B` filter precedence; `get_problems` drops filters; raw epoch floats | parenthesised filters, post-filter + size budget, `_iso`/`age_days` |
+| GCP BigQuery 403 on staging | GCP clients used ambient `GOOGLE_APPLICATION_CREDENTIALS` (the Vertex SA) | clients load their own configured file |
+| `instance_details` rejected by cost-monitor (8/8) | schema enum advertised a value the API refuses | removed |
+| `alert` API told unauthenticated callers its schema (422) | body validated before the key | key checked first, `hmac.compare_digest`; readiness returns 503 when not ready |
+
+**Not code — for owners:** every AAP2 controller rejects Parsec's stored credentials (5× 401;
+`east`/`west` no longer resolve) — broken since at least 2026-09-02 in production too, so the aap2
+agent and Debug Automation cannot read any job; `babydev`, `ocpv05`, `ocpv10` no longer resolve;
+parsec-dev runs with a hand-set `PARSEC_AGENT__SDK__ALLOW_WRITES=true` against the live Icinga.
+
+### Turn budgets and the delegation guard
+
+Two behaviours the same test exposed, fixed separately because they change how an investigation runs:
+
+- **Budgets.** The orchestrator was capped at `anthropic.max_tool_rounds` (10) and each sub-agent at
+  `max_rounds + 3` (11 for cost/babylon), with no warning. Sub-agents hit the cap mid-investigation
+  and returned narration ("Let me look up those sandbox owners…"), the orchestrator restarted from
+  scratch, and on staging q11 it hit its own cap and answered with a one-line preamble after 400 s
+  and $1.66. Now: `agent.sdk.max_turns` (default 30) for the orchestrator,
+  `max(max_rounds + 3, agent.sdk.subagent_min_turns)` (default 20) per sub-agent, the legacy
+  "2 rounds left, write your report" warning injected by a PostToolUse hook three **turns** before a
+  sub-agent's cap (counted from its transcript, not from tool calls — sub-agents make 2–3 calls per
+  turn), and on a turn-limit stop the sub-agents' reports are kept under "Partial findings" with one
+  error instead of being thrown away.
+- **Delegation.** The orchestrator could call every specialist tool itself (one MCP server, every
+  tool approved), so it skipped the specialist — and its prompt and skills — on 3 questions. A
+  PreToolUse hook now denies bridged specialist tools on the main thread (hook input without
+  `agent_id`) and tells the model which sub-agent to use; the orchestrator keeps its own direct tools,
+  the `db_*` tools and the read-only GitHub tools. Built-in sub-agent types (e.g. `general-purpose`)
+  cannot run Parsec tools either, so the guard cannot be sidestepped.
+
+Hook semantics were verified against the pinned CLI 2.1.169 before relying on them: hooks fire for
+in-process MCP tools; sub-agent calls carry `agent_id`/`agent_type`, main-thread calls do not; a
+deny stops the tool before it runs; a failed tool fires `PostToolUseFailure`, not `PostToolUse`.

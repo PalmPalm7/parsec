@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from src.connections.mlflow_tracking import get_experiment_name, get_mlflow_client
@@ -35,6 +37,40 @@ _DEFAULT_PRICING_USD_PER_TOKEN = (3e-6, 15e-6)  # assume Sonnet-class when unkno
 _CACHE_WRITE_MULTIPLIER = 1.25
 _CACHE_READ_MULTIPLIER = 0.10
 
+#: The image's commit, read on first use by :func:`build_version`.
+_build_version: str | None = None
+
+
+def build_version() -> str:
+    """The running image's git commit, 12 characters, or "" when unknown.
+
+    OpenShift's source build bakes ``OPENSHIFT_BUILD_COMMIT`` into the image.
+    The e2e run found staging serving an August image that was not the code
+    under test (F8), and neither the usage line nor MLflow said which image
+    produced a turn. The full commit is logged the first time it is read.
+    That is the first turn rather than startup: app.py configures logging
+    after this module is imported, so an import-time line would be dropped.
+    """
+    global _build_version
+    if _build_version is None:
+        commit = os.environ.get("OPENSHIFT_BUILD_COMMIT", "").strip()
+        _build_version = commit[:12]
+        logger.info("Parsec build commit: %s", commit or "unknown (OPENSHIFT_BUILD_COMMIT unset)")
+    return _build_version
+
+
+def _token(value: str) -> str:
+    """``value`` as one whitespace-free token for a k=v field; "-" when empty.
+
+    Readers split the usage line on whitespace and "=". The conversation id is
+    whatever the request body carried and sub_agents is model output, so a space
+    in either would shift the fields after it and a newline would start a
+    second, forged usage line.
+    """
+    if not value:
+        return "-"
+    return "".join(c if c.isprintable() and not c.isspace() else "_" for c in value)
+
 
 @dataclass
 class MetricsCollector:
@@ -50,6 +86,10 @@ class MetricsCollector:
     # Which LLM runtime produced this turn ("legacy" | "sdk"). Logged as a run
     # tag + param so legacy and SDK populations can be pivoted in one experiment.
     runtime: str = "legacy"
+    # Sub-agents the SDK orchestrator delegated to, in order and with repeats
+    # ("cost,cost,cost" is a re-delegation). agent_type stays "orchestrator" on
+    # that path, so without this every SDK turn looked alike.
+    sub_agents: str = ""
 
     # Metrics
     _start_time: float = 0.0
@@ -67,6 +107,11 @@ class MetricsCollector:
     # means "estimate from token counts" — see :meth:`resolved_cost_usd`.
     cost_usd: float = 0.0
     status: str = ""
+    # False when the runtime never reported usage for the turn: an SDK turn cut
+    # off before its ResultMessage (client gone, turn timeout, CLI failure). The
+    # zeros above then mean "not reported", not "free", so the token and cost
+    # figures are left out of MLflow and shown as "-" on the usage line.
+    usage_known: bool = True
 
     def start_timer(self) -> None:
         self._start_time = time.monotonic()
@@ -122,11 +167,18 @@ class MetricsCollector:
         self.cache_creation_tokens += cache_creation_tokens
         self.cache_read_tokens += cache_read_tokens
 
+    def mark_usage_unknown(self) -> None:
+        """The turn ended without the runtime reporting its tokens or cost."""
+        self.usage_known = False
+
     def record_model(self, model: str) -> None:
         self.model = model
 
     def record_runtime(self, runtime: str) -> None:
         self.runtime = runtime
+
+    def record_sub_agents(self, agent_types: Iterable[str]) -> None:
+        self.sub_agents = ",".join(agent_types)
 
     def record_cost(self, cost_usd: float) -> None:
         """Record an authoritative cost (the SDK reports ``total_cost_usd``).
@@ -169,23 +221,32 @@ class MetricsCollector:
                 "confidence": self.confidence,
                 "status": self.status,
                 "runtime": self.runtime,
+                "sub_agents": self.sub_agents,
+                "version": build_version(),
             }.items()
             if v
         }
 
     def to_metrics(self) -> dict[str, float]:
-        return {
+        metrics = {
             "total_latency_ms": self.total_latency_ms,
             "sub_agent_latency_ms": self.sub_agent_latency_ms,
             "tool_calls": float(self.tool_calls),
             "tool_errors": float(self.tool_errors),
             "rounds_used": float(self.rounds_used),
-            "input_tokens": float(self.input_tokens),
-            "output_tokens": float(self.output_tokens),
-            "cache_creation_tokens": float(self.cache_creation_tokens),
-            "cache_read_tokens": float(self.cache_read_tokens),
-            "cost_usd": self.resolved_cost_usd(),
         }
+        if self.usage_known:
+            # Left out rather than logged as 0 when unknown: a turn that ran for
+            # minutes before the client went away would otherwise log $0.00 and
+            # drag down every $-per-turn and token average it is part of.
+            metrics |= {
+                "input_tokens": float(self.input_tokens),
+                "output_tokens": float(self.output_tokens),
+                "cache_creation_tokens": float(self.cache_creation_tokens),
+                "cache_read_tokens": float(self.cache_read_tokens),
+                "cost_usd": self.resolved_cost_usd(),
+            }
+        return metrics
 
     def log_summary(self) -> None:
         """Emit one line of usage to the app log.
@@ -196,23 +257,53 @@ class MetricsCollector:
         were then collected and discarded, which made prompt-cache behaviour
         impossible to observe anywhere. This keeps them in the log regardless of
         whether the tracking server answers.
+
+        Readers match the head of the line, so it stays exactly as it was and
+        new fields only ever go on the end. The e2e harness filters on "usage
+        runtime=", and run_cache_test.py (parsec-parity-v2, rhdp-parsec-
+        integration) matches "usage runtime=… agent=… in=… … cost_usd=…" as one
+        regex. The conversation id and status are on the end: without them, costs
+        from the e2e run had to be paired with questions by log adjacency, and
+        an overlapping request made that ambiguous. ``version`` ties the line to
+        the image that produced it.
+
+        When the usage is unknown (see ``usage_known``) the token, cache-hit and
+        cost fields read "-", so no reader can take them for a free turn; the
+        run_cache_test.py regex then skips the line instead of counting zeros.
         """
-        cached_in = self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
-        hit_pct = (self.cache_read_tokens / cached_in * 100) if cached_in else 0.0
+        if self.usage_known:
+            cached_in = self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
+            hit_pct = (self.cache_read_tokens / cached_in * 100) if cached_in else 0.0
+            counts = (
+                str(self.input_tokens),
+                str(self.output_tokens),
+                str(self.cache_read_tokens),
+                str(self.cache_creation_tokens),
+                f"{hit_pct:.1f}%",
+                f"{self.resolved_cost_usd():.4f}",
+            )
+        else:
+            counts = ("-",) * 6
+        n_in, n_out, n_read, n_write, hit, cost = counts
         logger.info(
-            "usage runtime=%s agent=%s in=%d out=%d cache_read=%d cache_write=%d "
-            "cache_hit=%.1f%% tools=%d errors=%d cost_usd=%.4f latency_ms=%.0f",
-            self.runtime or "-",
-            self.agent_type or "-",
-            self.input_tokens,
-            self.output_tokens,
-            self.cache_read_tokens,
-            self.cache_creation_tokens,
-            hit_pct,
+            "usage runtime=%s agent=%s in=%s out=%s cache_read=%s cache_write=%s "
+            "cache_hit=%s tools=%d errors=%d cost_usd=%s latency_ms=%.0f "
+            "conversation_id=%s status=%s version=%s sub_agents=%s",
+            _token(self.runtime),
+            _token(self.agent_type),
+            n_in,
+            n_out,
+            n_read,
+            n_write,
+            hit,
             self.tool_calls,
             self.tool_errors,
-            self.resolved_cost_usd(),
+            cost,
             self.total_latency_ms,
+            _token(self.conversation_id),
+            _token(self.status),
+            _token(build_version()),
+            _token(self.sub_agents),
         )
 
     async def flush_to_mlflow(self) -> None:

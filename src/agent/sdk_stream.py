@@ -47,9 +47,30 @@ _CLI_ERROR_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
     ),
 )
 
+#: Token fields as ``record_tokens`` takes them, and as ``ResultMessage`` spells
+#: them in ``model_usage`` (camelCase, one entry per model) and in ``usage``.
+_MODEL_USAGE_FIELDS = {
+    "input_tokens": "inputTokens",
+    "output_tokens": "outputTokens",
+    "cache_creation_tokens": "cacheCreationInputTokens",
+    "cache_read_tokens": "cacheReadInputTokens",
+}
+_USAGE_FIELDS = {
+    "input_tokens": "input_tokens",
+    "output_tokens": "output_tokens",
+    "cache_creation_tokens": "cache_creation_input_tokens",
+    "cache_read_tokens": "cache_read_input_tokens",
+}
+
 
 class SdkEventTranslator:
     """Stateful translator for one orchestrator turn."""
+
+    #: Every delegation this turn, in order and with repeats, for the usage line;
+    #: ``_active_agents`` forgets an agent as soon as it reports back.
+    _delegated: tuple[str, ...] = ()
+    #: Set once the turn's usage is recorded, so it is never recorded twice.
+    _metrics_recorded: bool = False
 
     def __init__(self, *, question: str, history: list, config: Any = None) -> None:
         self._question = question
@@ -62,9 +83,15 @@ class SdkEventTranslator:
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._text_parts: list[str] = []
         self._active_agents: dict[str, str] = {}
+        #: (agent_type, final message) for every delegation that returned, kept
+        #: so a turn-limited run can still show what the specialists found.
+        self._agent_reports: list[tuple[str, str]] = []
         self._skills_seen: set[str] = set()
         self._usage: Any | None = None
         self._session_id: str | None = None
+        #: Set by the caller when it stops the run itself (e.g. the turn timed
+        #: out); takes precedence over what the ResultMessage would imply.
+        self._forced_failure: str | None = None
 
     # ------------------------------------------------------------- input
 
@@ -129,6 +156,9 @@ class SdkEventTranslator:
         from src.agent.streaming import sse_text
 
         event = getattr(message, "event", None) or {}
+        if event.get("type") == "content_block_start":
+            yield from self._separate_text_block(message, event)
+            return
         if event.get("type") != "content_block_delta":
             return
         delta = event.get("delta") or {}
@@ -143,6 +173,26 @@ class SdkEventTranslator:
             return
         self._text_parts.append(chunk)
         yield sse_text(chunk)
+
+    def _separate_text_block(self, message: Any, event: dict) -> Iterator[str]:
+        """Start each top-level text block on a new paragraph.
+
+        The orchestrator's narration before a tool call and its answer after it
+        are separate text blocks, and their deltas were joined as they arrived.
+        On the live pods that produced "…in parallel.## GCP Open Environment",
+        in the streamed answer and in the saved history alike.
+        """
+        from src.agent.streaming import sse_text
+
+        block = event.get("content_block") or {}
+        if block.get("type") != "text" or getattr(message, "parent_tool_use_id", None):
+            return
+        so_far = "".join(self._text_parts)
+        if not so_far.strip() or so_far.endswith("\n\n"):
+            return
+        separator = "\n" if so_far.endswith("\n") else "\n\n"
+        self._text_parts.append(separator)
+        yield sse_text(separator)
 
     def _translate_assistant(self, message: Any) -> Iterator[str]:
         from claude_agent_sdk import ToolUseBlock
@@ -206,6 +256,7 @@ class SdkEventTranslator:
 
         if tool_use_id:
             self._active_agents[tool_use_id] = agent_type
+        self._delegated += (agent_type,)
         agent_cfg = AGENTS.get(agent_type)
         name = agent_cfg.name if agent_cfg else agent_type
         yield sse_agent_start(agent_type, name)
@@ -238,6 +289,9 @@ class SdkEventTranslator:
             tool_use_id = getattr(block, "tool_use_id", "")
             agent_type = self._active_agents.pop(tool_use_id, None)
             if agent_type:
+                report = _agent_report_text(getattr(block, "content", None))
+                if report:
+                    self._agent_reports.append((agent_type, report))
                 yield sse_agent_done(agent_type)
 
     def _capture_result(self, message: Any) -> None:
@@ -259,27 +313,71 @@ class SdkEventTranslator:
         So misconfiguration is named as misconfiguration, with the raw text kept
         alongside for whoever reads the log.
         """
+        if self._forced_failure:
+            return self._forced_failure
         msg = self._usage
         if msg is None:
             return "the agent runtime produced no result"
+        # Checked on its own, before is_error: the subtype is what names a
+        # turn-limited run, and finish() keys the partial-findings fallback on
+        # it, so neither may depend on how a given CLI version sets is_error.
+        if self._hit_turn_limit():
+            turns = getattr(msg, "num_turns", None)
+            shown = " (the specialists' findings so far are shown above)"
+            return (
+                f"the investigation hit its turn limit after {turns} turns "
+                "without finishing — raise agent.sdk.max_turns or narrow the question"
+                + (shown if self._agent_reports else "")
+            )
         if not getattr(msg, "is_error", False):
             # A clean run that still said nothing is a failure worth surfacing.
             if not "".join(self._text_parts).strip():
                 return "the agent finished without producing an answer"
             return ""
         subtype = str(getattr(msg, "subtype", "") or "")
-        if subtype == "error_max_turns":
-            turns = getattr(msg, "num_turns", None)
-            return (
-                f"the investigation hit its turn limit after {turns} turns "
-                "without finishing — raise agent.sdk.max_turns or narrow the question"
-            )
         detail = str(getattr(msg, "result", None) or subtype or "unknown error")
         lowered = detail.lower()
         for needles, hint in _CLI_ERROR_HINTS:
             if any(needle in lowered for needle in needles):
                 return f"{hint} (the runtime said: {detail})"
         return f"the agent runtime failed: {detail}"
+
+    def _hit_turn_limit(self) -> bool:
+        return (
+            not self._forced_failure
+            and self._usage is not None
+            and getattr(self._usage, "subtype", None) == "error_max_turns"
+        )
+
+    def _partial_findings(self) -> str:
+        """The specialists' reports, for a run that ran out of turns.
+
+        The orchestrator's text is then usually a preamble: on the live staging
+        pod q11 ended at the orchestrator's turn limit with the 156 characters
+        "…Delegating to the Babylon agent to investigate." while its sub-agents
+        had already resolved 2w27z to a ResourceClaim. Their reports are the only
+        findings the turn produced, so they are kept rather than discarded.
+        """
+        if not self._hit_turn_limit() or not self._agent_reports:
+            return ""
+        from src.agent.agents import AGENTS
+
+        # A report the orchestrator already relayed, as the delegation addendum
+        # asks, is in the answer; appending it again doubled it in the stream
+        # and in the saved history.
+        answer = "".join(self._text_parts)
+        pending = [(t, r) for t, r in self._agent_reports if not _already_relayed(r, answer)]
+        if not pending:
+            return ""
+        parts = ["\n\n## Partial findings (turn limit reached)\n"]
+        for agent_type, report in pending:
+            cfg = AGENTS.get(agent_type)
+            parts.append(f"\n### {cfg.name if cfg else agent_type}\n\n{report}\n")
+        return "".join(parts)
+
+    def fail(self, reason: str) -> None:
+        """Record why the caller stopped this run; :meth:`finish` reports it once."""
+        self._forced_failure = reason
 
     # ------------------------------------------------------------ finish
 
@@ -289,7 +387,12 @@ class SdkEventTranslator:
         ``history`` must precede ``done``: the browser's ``saveConversation()``
         runs on it, and without it the answer is lost on refresh.
         """
-        from src.agent.streaming import sse_done, sse_event
+        from src.agent.streaming import sse_done, sse_event, sse_text
+
+        partial = self._partial_findings()
+        if partial:
+            self._text_parts.append(partial)
+            yield sse_text(partial)
 
         answer = "".join(self._text_parts).strip()
         self._record_metrics(collector)
@@ -312,23 +415,38 @@ class SdkEventTranslator:
         yield sse_event("history", {"messages": history})
         yield sse_done()
 
-    def _record_metrics(self, collector: Any) -> None:
+    def record_aborted(self, collector: Any) -> None:
+        """Record the turn as aborted unless :meth:`finish` already recorded it.
+
+        A browser that goes away closes the response generator at a ``yield``
+        (``GeneratorExit``) or cancels it at an ``await`` (``CancelledError``),
+        so ``finish`` never runs and the turn left no usage line at all. The
+        orchestrator calls this from a ``finally``, so it must not yield.
+        """
+        self._record_metrics(collector, status="aborted")
+
+    def _record_metrics(self, collector: Any, *, status: str | None = None) -> None:
         """Record usage, then flush. Never let telemetry break the response."""
+        if self._metrics_recorded:
+            return
+        self._metrics_recorded = True
         try:
-            usage = getattr(self._usage, "usage", None) or {}
-            if isinstance(usage, dict):
-                collector.record_tokens(
-                    input_tokens=usage.get("input_tokens", 0) or 0,
-                    output_tokens=usage.get("output_tokens", 0) or 0,
-                    cache_creation_tokens=usage.get("cache_creation_input_tokens", 0) or 0,
-                    cache_read_tokens=usage.get("cache_read_input_tokens", 0) or 0,
-                )
-            cost = getattr(self._usage, "total_cost_usd", None)
-            if cost:
-                collector.record_cost(cost)
-            model = getattr(self._usage, "model", None)
-            if model and not getattr(collector, "model", None):
-                collector.record_model(model)
+            if self._usage is None:
+                # No ResultMessage: the turn was cut off (client gone, turn
+                # timeout, CLI failure) before the CLI reported what it used.
+                # Recording 0 tokens and $0 would log a turn that ran for minutes
+                # as free; the collector leaves the figures out instead.
+                collector.mark_usage_unknown()
+            else:
+                collector.record_tokens(**_turn_tokens(self._usage))
+                cost = getattr(self._usage, "total_cost_usd", None)
+                if cost:
+                    collector.record_cost(cost)
+            # The legacy loop sets a turn status; the SDK path left it blank, so
+            # failed SDK turns were indistinguishable from successful ones in MLflow.
+            collector.status = status or ("error" if self._failure_reason() else "success")
+            if self._delegated:
+                collector.record_sub_agents(self._delegated)
         except Exception:
             logger.exception("Failed to record SDK orchestrator metrics")
 
@@ -346,6 +464,76 @@ class SdkEventTranslator:
     @property
     def session_id(self) -> str | None:
         return self._session_id
+
+
+def _turn_tokens(result: Any) -> dict[str, int]:
+    """Token counts for the whole turn, sub-agents included.
+
+    ``usage`` counts only the orchestrator's own API calls; ``model_usage`` has
+    every call the CLI made, sub-agents included, per model. From ``usage``
+    staging q13 logged in=10 out=9586, about $0.34 at list price, for a turn the
+    SDK itself costed at $3.93. ``usage`` is the fallback for a CLI without it.
+    """
+    per_model = getattr(result, "model_usage", None)
+    if isinstance(per_model, dict) and per_model:
+        entries = [e for e in per_model.values() if isinstance(e, dict)]
+        fields = _MODEL_USAGE_FIELDS
+    else:
+        usage = getattr(result, "usage", None)
+        entries = [usage] if isinstance(usage, dict) else []
+        fields = _USAGE_FIELDS
+    return {ours: sum(int(e.get(theirs) or 0) for e in entries) for ours, theirs in fields.items()}
+
+
+#: A report counts as relayed when its start, this many characters or half the
+#: report if longer, appears word for word (whitespace aside) in the answer.
+_RELAYED_PREFIX_MIN = 200
+
+
+def _squash(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _already_relayed(report: str, answer: str) -> bool:
+    """Whether the orchestrator's own text already carries this report.
+
+    The staging reports all opened with narration ("I now have all the data
+    needed. Let me compile the complete picture.") that a relay drops, so the
+    body after the opening paragraph is tried as well as the whole report.
+
+    Deliberately strict otherwise: a relay that rewrote the report is not a copy
+    of it, and the staging relays that did (q10 turned "$356 ($346 metal + $10
+    GPU)" into "$356*") are exactly when the specialist's own words are worth
+    showing.
+    """
+    said = _squash(answer)
+    _, _, body = report.strip().partition("\n\n")
+    for text in (report, body):
+        flat = _squash(text)
+        if flat and flat[: max(_RELAYED_PREFIX_MIN, len(flat) // 2)] in said:
+            return True
+    return not _squash(report)
+
+
+def _agent_report_text(content: Any) -> str:
+    """A delegation's tool_result reduced to the sub-agent's final message.
+
+    The CLI appends a block of its own after the report ("agentId: … (use
+    SendMessage … to continue this agent)" plus a ``<usage>`` footer). It is
+    meaningless to a reader, and SendMessage is not available here, so it is
+    dropped.
+    """
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        text = block.get("text") if isinstance(block, dict) else None
+        if not isinstance(text, str) or text.lstrip().startswith("agentId:"):
+            continue
+        parts.append(text.strip())
+    return "\n\n".join(p for p in parts if p)
 
 
 def _flatten_content(content: Any) -> str:

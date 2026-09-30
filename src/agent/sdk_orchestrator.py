@@ -28,6 +28,7 @@ produced them.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncGenerator, Iterable
 from typing import Any, cast
@@ -84,7 +85,7 @@ def _today() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%d")
 
 
-#: Appended to every subagent prompt.
+#: Appended to every subagent prompt, formatted with that agent's turn budget.
 #:
 #: Only a subagent's FINAL message returns to the orchestrator — its tool
 #: results stay in its own context. So whatever it omits from that message is
@@ -109,7 +110,35 @@ State the root cause and the concrete next steps.
 
 Length is not a virtue, but omitting specifics is a defect — a tidy answer that
 drops the identifiers an SRE needs is worse than a long one that keeps them.
+
+You have at most {max_turns} turns; stop calling tools by turn {stop_by} and write
+the report. A run that hits the limit returns whatever you said last, and a
+"let me check one more thing" is not a report.
 """
+
+
+#: Orchestrator turns per question. Every delegation costs one on top of the
+#: orchestrator's own tool rounds, so the legacy loop's ten tool rounds
+#: (``anthropic.max_tool_rounds``) are far too few.
+DEFAULT_ORCHESTRATOR_MAX_TURNS = 30
+
+#: Floor for every sub-agent's ``maxTurns``; see ``_agent_definitions``.
+DEFAULT_SUBAGENT_MIN_TURNS = 20
+
+
+def _positive_int(raw: object, default: int, key: str) -> int:
+    """``raw`` as a positive int; unset uses ``default``, junk warns and uses it."""
+    if raw in (None, ""):
+        return default
+    try:
+        value = int(str(raw))
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not an integer; using %d", key, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("%s=%r must be positive; using %d", key, raw, default)
+        return default
+    return value
 
 
 def _agent_definitions(config: Any) -> dict[str, Any]:
@@ -132,6 +161,11 @@ def _agent_definitions(config: Any) -> dict[str, Any]:
     from src.agent.system_prompt import get_agent_prompt
 
     enabled = enabled_sdk_agents(config)
+    min_turns = _positive_int(
+        _sdk_section_of(config).get("subagent_min_turns"),
+        DEFAULT_SUBAGENT_MIN_TURNS,
+        "agent.sdk.subagent_min_turns",
+    )
     definitions: dict[str, Any] = {}
 
     # One discovery + state read for the whole turn rather than one per agent.
@@ -149,6 +183,11 @@ def _agent_definitions(config: Any) -> dict[str, Any]:
             # delegate to a half-migrated agent.
             continue
 
+        # The legacy round budget plus headroom was too tight on the SDK: on
+        # the live staging pod both cost agents for "top GPU users this week"
+        # hit their 11-turn cap mid-investigation, on a question that needed
+        # 28-31 tool calls.
+        max_turns = max(agent_cfg.max_rounds + TURN_HEADROOM, min_turns)
         kwargs: dict[str, Any] = {
             "description": agent_cfg.description or f"{agent_cfg.name} specialist",
             # Same date grounding the legacy sub-agent loop appends
@@ -157,10 +196,10 @@ def _agent_definitions(config: Any) -> dict[str, Any]:
             "prompt": (
                 f"{get_agent_prompt(agent_type)}"
                 f"\n\nToday's date is {_today()}."
-                f"{_SUBAGENT_OUTPUT_CONTRACT}"
+                + _SUBAGENT_OUTPUT_CONTRACT.format(max_turns=max_turns, stop_by=max_turns - 2)
             ),
             "tools": tool_names_for(list(agent_cfg.tools)),
-            "maxTurns": agent_cfg.max_rounds + TURN_HEADROOM,
+            "maxTurns": max_turns,
         }
         skills = skills_for(agent_type, config, attachments=attachments)
         if skills:
@@ -189,12 +228,23 @@ def _union_tool_schemas() -> list[dict]:
     return list(seen.values())
 
 
+def _tool_owners(agents: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each bridged tool name to the enabled sub-agents that may call it."""
+    owners: dict[str, list[str]] = {}
+    for agent_type, definition in agents.items():
+        for name in definition.tools or ():
+            owners.setdefault(name, []).append(agent_type)
+    return owners
+
+
 def build_orchestrator_options(config: Any, *, system: str) -> Any:
     """Assemble ``ClaudeAgentOptions`` for one orchestrator turn."""
     from claude_agent_sdk import ClaudeAgentOptions
 
     from src.agent.parsec_mcp import SERVER_NAME, build_server, tool_names_for
+    from src.agent.sdk_hooks import build_hooks
     from src.agent.sdk_profiles import _sdk_section
+    from src.agent.tool_definitions import get_orchestrator_direct_tools
     from src.llm.agent_sdk_client import (
         AgentSdkConfig,
         backend_cli_env,
@@ -217,14 +267,25 @@ def build_orchestrator_options(config: Any, *, system: str) -> Any:
     # refused: the icinga agent reported "unable to access the monitoring system
     # due to permission restrictions" and answered with no tool calls at all.
     #
-    # This does not widen what any individual agent can reach — availability is
-    # still per-agent via `AgentDefinition.tools` (see `_agent_definitions`).
-    # Approval is session-wide; availability is per-agent.
+    # Approval is session-wide, so it does widen what the main thread can
+    # reach: the orchestrator could call every specialist tool itself, and on
+    # the live pods it did instead of delegating. Sub-agents are narrowed by
+    # `AgentDefinition.tools` (see `_agent_definitions`); the main thread is
+    # narrowed to its own direct tools by the PreToolUse guard in sdk_hooks,
+    # which also keeps every Parsec tool from the CLI's built-in agent types.
     approved_tools = tool_names_for(schemas)
+    direct_tools = tool_names_for(get_orchestrator_direct_tools())
 
     anthropic_cfg = _section_get(config, "anthropic")
     model = sdk_cfg.get("model") or anthropic_cfg.get("model") or "claude-sonnet-4-6"
-    max_turns = int(sdk_cfg.get("max_turns") or anthropic_cfg.get("max_tool_rounds") or 10)
+    # Not anthropic.max_tool_rounds: that is the legacy loop's budget of tool
+    # rounds, and every delegation costs the orchestrator turns too. Falling
+    # back to it (10) ended staging q11 at turn 11 with a 156-character
+    # preamble, after the sub-agents had already found the answer.
+    max_turns = _positive_int(
+        sdk_cfg.get("max_turns"), DEFAULT_ORCHESTRATOR_MAX_TURNS, "agent.sdk.max_turns"
+    )
+    agents = _agent_definitions(config)
 
     defaults = AgentSdkConfig(model=str(model))
     # Pin the binary here too. Without it the SDK picks the CLI bundled in its
@@ -238,7 +299,15 @@ def build_orchestrator_options(config: Any, *, system: str) -> Any:
         cli_path=cli_path,
         system_prompt=system,
         max_turns=max_turns,
-        agents=_agent_definitions(config),
+        agents=agents,
+        # Warns each sub-agent before its maxTurns, as the legacy loop does, and
+        # keeps specialist tools off the main thread and out of built-in agents.
+        hooks=build_hooks(
+            turn_limits={name: d.maxTurns for name, d in agents.items() if d.maxTurns},
+            direct_tools=direct_tools,
+            tool_owners=_tool_owners(agents),
+            specialists=agents,
+        ),
         mcp_servers={SERVER_NAME: server},
         allowed_tools=[*approved_tools, *_ORCHESTRATOR_EXTRA_TOOLS],
         # Availability, not just auto-approval — see agent_sdk_client._build_options.
@@ -307,6 +376,10 @@ def _delegation_addendum(config: Any) -> str:
         "instructions above intend. Handle only cross-domain synthesis and your own",
         "direct tools yourself.",
         "",
+        "After a specialist returns, do not repeat its tool calls yourself. If its reply",
+        "is not a finished report, delegate once more with the facts it already found,",
+        "not the original broad task.",
+        "",
         "### Relay specialist findings in full",
         "",
         "A specialist's reply is the finished answer for its domain. **Relay it in",
@@ -366,6 +439,35 @@ def _sdk_section_safe(config: Any) -> dict:
     return _sdk_section(config)
 
 
+#: Wall-clock ceiling for one whole orchestrator turn, sub-agents included.
+#: ``agent.sdk.timeout`` (300s) bounds a single sub-agent call on the per-agent
+#: path; the whole-turn path had no ceiling at all, so a hung CLI held the
+#: request open until the browser gave up. Longer than the per-call limit on
+#: purpose: real multi-agent investigations run 2-7 minutes.
+DEFAULT_TURN_TIMEOUT_S = 900.0
+
+
+def _sdk_section_of(config: Any) -> dict[str, Any]:
+    from src.agent.sdk_profiles import _sdk_section
+
+    return _sdk_section(config)
+
+
+def _turn_timeout(sdk_cfg: dict[str, Any]) -> float | None:
+    """``agent.sdk.turn_timeout`` in seconds; 0/null disables, junk falls back."""
+    raw = sdk_cfg.get("turn_timeout", DEFAULT_TURN_TIMEOUT_S)
+    if raw in (None, ""):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "agent.sdk.turn_timeout=%r is not a number; using %ss", raw, DEFAULT_TURN_TIMEOUT_S
+        )
+        return DEFAULT_TURN_TIMEOUT_S
+    return value if value > 0 else None
+
+
 async def run_agent_via_sdk(
     question: str,
     conversation_history: list | None = None,
@@ -378,14 +480,18 @@ async def run_agent_via_sdk(
     event names, same ordering, same terminating ``history`` + ``done`` pair, so
     ``routes/query.py`` and the frontend are unchanged.
     """
-    from src.agent.parsec_mcp import sse_sink
+    from src.agent.parsec_mcp import ToolStats, sse_sink, tool_stats, turn_conversation_id
     from src.agent.sdk_stream import SdkEventTranslator
     from src.agent.streaming import sse_done, sse_error
     from src.config import get_config
+    from src.connections import turn_state
     from src.metrics.collector import MetricsCollector
 
     cfg = get_config()
     collector = MetricsCollector(conversation_id=conversation_id or session_id or "")
+    # Without this the flush's stop_timer() has nothing to measure from, and
+    # every SDK turn reached MLflow with total_latency_ms=0.
+    collector.start_timer()
     collector.record_runtime("sdk")
     collector.record_agent_dispatch("orchestrator", routing_method="sdk")
 
@@ -404,6 +510,12 @@ async def run_agent_via_sdk(
         yield sse_done()
         return
 
+    # ResultMessage carries no model name, so the options are the only record of
+    # which model ran the turn; MLflow's model param was blank for every SDK turn.
+    model = getattr(options, "model", None)
+    if model:
+        collector.record_model(str(model))
+
     prompt = translator.build_prompt()
 
     # The bridge pushes tool events onto the same queue the translator drains,
@@ -416,24 +528,73 @@ async def run_agent_via_sdk(
 
     cache_token = _tool_cache.set({})
 
+    turn_timeout = _turn_timeout(_sdk_section_of(cfg))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + turn_timeout if turn_timeout else None
+
+    def _remaining() -> float | None:
+        if deadline is None:
+            return None
+        left = deadline - loop.time()
+        if left <= 0:
+            raise TimeoutError
+        return left
+
     token = sse_sink.set(translator.push)
+    stats = ToolStats()
+    stats_token = tool_stats.set(stats)
+    # So the bridge's Icinga write audit can name the conversation it acts for.
+    conversation_token = turn_conversation_id.set(collector.conversation_id or None)
+    # Connectors remember a target that failed for good (401/403, DNS) for the
+    # rest of this turn and no longer. Opened before the client starts, like the
+    # two above, so the bridge's handler tasks share it.
+    dead_token = turn_state.begin_turn()
     try:
-        from claude_agent_sdk import ClaudeSDKClient
+        try:
+            from claude_agent_sdk import ClaudeSDKClient
 
-        async with ClaudeSDKClient(options) as client:
-            await client.query(prompt)
-            async for message in client.receive_response():
-                for event in translator.translate(message):
-                    yield event
-                # Drain anything the bridge queued while that message was handled.
-                for event in translator.drain():
-                    yield event
-    except Exception as e:
-        logger.exception("SDK orchestrator failed")
-        yield sse_error(str(e))
+            # The ceiling is applied to each await, not with `asyncio.timeout()`
+            # around the loop: this is an async generator, and a cancellation that
+            # lands while it is suspended at a `yield` would be raised inside the
+            # response writer instead, killing the stream with no error event.
+            async with ClaudeSDKClient(options) as client:
+                await asyncio.wait_for(client.query(prompt), _remaining())
+                messages = client.receive_response().__aiter__()
+                while True:
+                    try:
+                        message = await asyncio.wait_for(anext(messages), _remaining())
+                    except StopAsyncIteration:
+                        break
+                    for event in translator.translate(message):
+                        yield event
+                    # Drain anything the bridge queued while that message was handled.
+                    for event in translator.drain():
+                        yield event
+        except TimeoutError:
+            # Leaving the `async with` above has already stopped the CLI subprocess.
+            logger.warning(
+                "SDK orchestrator turn exceeded agent.sdk.turn_timeout=%ss", turn_timeout
+            )
+            translator.fail(
+                f"the investigation was stopped after {int(turn_timeout or 0)}s "
+                "(agent.sdk.turn_timeout) — narrow the question or raise the limit"
+            )
+        except Exception as e:
+            logger.exception("SDK orchestrator failed")
+            yield sse_error(str(e))
+        finally:
+            collector.tool_calls += stats.calls
+            collector.tool_errors += stats.errors
+            sse_sink.reset(token)
+            tool_stats.reset(stats_token)
+            turn_conversation_id.reset(conversation_token)
+            turn_state.end_turn(dead_token)
+            _tool_cache.reset(cache_token)
+
+        for event in translator.finish(collector):
+            yield event
     finally:
-        sse_sink.reset(token)
-        _tool_cache.reset(cache_token)
-
-    for event in translator.finish(collector):
-        yield event
+        # A client that disconnects stops this generator at a `yield` or an
+        # `await`, so finish() never runs. Record the turn as aborted instead of
+        # losing it; after finish() this is a no-op. No `yield` in here.
+        translator.record_aborted(collector)

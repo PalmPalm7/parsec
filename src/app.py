@@ -37,6 +37,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
 )
+# The Azure SDK's HTTP logging policy writes every request and response header
+# block at INFO — ~20 lines per Cosmos call (azure_pools), which buried the
+# app's own lines in the pod log. Its warnings and errors still come through.
+logging.getLogger("azure").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 

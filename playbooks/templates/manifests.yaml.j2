@@ -35,6 +35,15 @@ data:
         orchestrator: {{ sdk_orchestrator | default(false) | bool | to_json }}
         allow_writes: {{ sdk_allow_writes | default(false) | bool | to_json }}
         timeout: {{ sdk_timeout | default(300) }}
+        # Turn budgets. Without max_turns the orchestrator falls back to
+        # anthropic.max_tool_rounds above (10); turn_timeout bounds the whole
+        # turn (seconds, 0 disables). subagent_min_turns only matters to an
+        # orchestrator build that reads it (the SDK turn-budget change): there
+        # it floors each orchestrated sub-agent's cap. Code without that change
+        # ignores the key, and each sub-agent keeps its max_rounds + 3.
+        max_turns: {{ sdk_max_turns | default(30) }}
+        subagent_min_turns: {{ sdk_subagent_min_turns | default(20) }}
+        turn_timeout: {{ sdk_turn_timeout | default(900) }}
     provision_db:
       max_rows: 500
     aws:
@@ -114,6 +123,44 @@ spec:
       port: 8000
       targetPort: 8000
       protocol: TCP
+{% if network_policy_enabled | default(false) | bool %}
+---
+# NetworkPolicy — who may reach the app port (opt-in, see common.yml).
+# The app takes the caller's identity from X-Forwarded-Email, which only the
+# oauth-proxy sets after a login. Allowed: the oauth-proxy pod, the OpenShift
+# router (the parsec-health route targets parsec-service directly) and
+# host-network traffic (kubelet probes). The icinga-mcp sidecar is reached
+# over localhost and is unaffected.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: parsec-api-ingress
+  labels:
+    app: parsec
+    component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: parsec
+      component: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: parsec-oauth-proxy
+              component: oauth-proxy
+        - namespaceSelector:
+            matchLabels:
+              policy-group.network.openshift.io/ingress: ""
+        - namespaceSelector:
+            matchLabels:
+              policy-group.network.openshift.io/host-network: ""
+      ports:
+        - protocol: TCP
+          port: 8000
+{% endif %}
 ---
 # Deployment
 apiVersion: apps/v1
@@ -280,13 +327,15 @@ spec:
             - name: ocpv-kubeconfigs
               mountPath: /app/ocpv
               readOnly: true
+          # Defaults fit the legacy runtime; common.yml sizes the pod for the SDK
+          # runtime, which runs a `claude` CLI subprocess beside the app per turn.
           resources:
             requests:
               memory: "{{ deployment_memory_request | default('256Mi') }}"
-              cpu: "100m"
+              cpu: "{{ deployment_cpu_request | default('100m') }}"
             limits:
               memory: "{{ deployment_memory_limit | default('512Mi') }}"
-              cpu: "500m"
+              cpu: "{{ deployment_cpu_limit | default('500m') }}"
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true

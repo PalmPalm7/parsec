@@ -1,11 +1,78 @@
 """Tool: query_icinga — query Icinga2 monitoring via the MCP sidecar server."""
 
+import json
 import logging
+import re
+import time
+from datetime import UTC, datetime
 from typing import Any
 
 from src.connections.icinga_mcp import call_tool
 
 logger = logging.getLogger(__name__)
+
+#: Most objects a get_problems result may carry; the rest are counted, not sent.
+_MAX_PROBLEMS = 40
+
+#: Most characters one check-result field (output, performance_data, command)
+#: keeps in a get_problems result. A single ocpv-pvc-usage service carried
+#: 149,345 characters of per-PVC performance data. The head of the output and
+#: of the perfdata shows what is wrong; get_services with detailed=true
+#: returns one service's whole check result.
+_CHECK_FIELD_CHARS = 1_000
+
+#: The bridge passes a tool result of up to this many characters (of its JSON)
+#: to the model whole and cuts a longer one to its first 10,000. Mirrors
+#: orchestrator.MAX_TOOL_RESULT_CHARS, which cannot be imported here without a
+#: cycle; a test keeps the two equal.
+_BRIDGE_CAP = 100_000
+
+#: Size budget for the text of a get_problems result, measured as the bridge
+#: measures it (JSON-escaped). Well under _BRIDGE_CAP, where a cut drops most
+#: of the objects; the margin leaves room for the counts, hint and note.
+_PROBLEMS_BUDGET = 60_000
+
+#: Icinga attributes holding Unix timestamps. Listed by name rather than "any
+#: number above 1e9" because byte counters in vars reach that size too, and
+#: execution_start / schedule_* are left out: they sit within seconds or
+#: minutes of execution_end (21 s on one live check), which is
+#: indistinguishable at the day resolution of _age_days.
+_EPOCH_FIELDS: frozenset[str] = frozenset(
+    {
+        "entry_time",
+        "expire_time",
+        "start_time",
+        "end_time",
+        "trigger_time",
+        "remove_time",
+        "last_check",
+        "next_check",
+        "last_state_change",
+        "last_hard_state_change",
+        "previous_state_change",
+        "last_state_ok",
+        "last_state_warning",
+        "last_state_critical",
+        "last_state_unknown",
+        "last_state_up",
+        "last_state_down",
+        "last_state_unreachable",
+        "acknowledgement_expiry",
+        "acknowledgement_last_change",
+        "flapping_last_change",
+        "execution_end",
+        "last_notification",
+        "next_notification",
+    }
+)
+
+#: The only filter_expr shape get_problems can apply itself: one name equality,
+#: e.g. ``host.name == "ocpvirt7"``. The value stops at its closing quote, so a
+#: compound such as ``host.name == "a" && service.name == "b"`` does not match
+#: and is reported as ignored, instead of being read as one host literally
+#: named ``a" && service.name == "b`` that matches nothing. display_name is not
+#: accepted: the objects get_problems returns carry no display names.
+_NAME_EQUALITY = re.compile(r"""^\s*(host|service)\.name\s*==\s*(["'])((?:(?!\2).)*)\2\s*$""")
 
 
 def _build_read_args(
@@ -20,7 +87,10 @@ def _build_read_args(
     if service:
         args["service"] = service
     if filter_expr:
-        args["filter_expr"] = filter_expr
+        # The monitoring-mcp server joins the host, service and filter clauses
+        # with "&&", so an unbracketed "A || B" binds as "(host && A) || B" and
+        # returns every host that matches B.
+        args["filter_expr"] = f"({filter_expr})"
     args["detailed"] = detailed
     return args
 
@@ -96,10 +166,13 @@ async def query_icinga(
 
     if action in ("get_hosts", "get_services"):
         args = _build_read_args(search, host, service, filter_expr, detailed)
-        return await call_tool(action, args)
+        return _with_readable_result(await call_tool(action, args))
 
     if action == "get_problems":
-        return await call_tool("get_problems", {})
+        # The MCP tool takes no arguments and always returns every problem in
+        # Icinga, so the caller's filters are applied to its result instead.
+        raw = await call_tool("get_problems", {})
+        return _filter_problems(raw, host, service, filter_expr)
 
     if action in ("get_downtimes", "get_comments"):
         filter_args: dict[str, Any] = {}
@@ -107,7 +180,7 @@ async def query_icinga(
             filter_args["host"] = host
         if service:
             filter_args["service"] = service
-        return await call_tool(action, filter_args)
+        return _with_readable_result(await call_tool(action, filter_args))
 
     if action == "remove_comment":
         if not comment_name:
@@ -120,6 +193,278 @@ async def query_icinga(
         )
 
     return {"error": f"Unknown icinga action: {action}"}
+
+
+def _decoded(raw: dict[str, Any]) -> Any:
+    """Return the MCP result text decoded as JSON, or None for errors and plain text."""
+    text = raw.get("result")
+    if not isinstance(text, str):
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def _encoded(data: Any) -> str:
+    """Serialise like the monitoring-mcp server does, so the text reads the same."""
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+def _is_epoch(value: Any) -> bool:
+    # Icinga writes 0 for "never"; the upper bound keeps millisecond values out.
+    return isinstance(value, int | float) and not isinstance(value, bool) and 1e9 < value < 1e10
+
+
+def _with_readable_times(value: Any, now: float, iso: bool = True) -> Any:
+    """Copy ``value``, adding ``<field>_iso`` and ``<field>_age_days`` after each epoch field.
+
+    Left with raw epoch seconds the model does the date arithmetic itself and
+    gets it wrong. A negative age is in the future (next_check, a downtime's
+    end_time). ``iso=False`` adds only the ages, for results short of room.
+    """
+    if isinstance(value, list):
+        return [_with_readable_times(item, now, iso) for item in value]
+    if not isinstance(value, dict):
+        return value
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        out[key] = _with_readable_times(item, now, iso)
+        if key in _EPOCH_FIELDS and _is_epoch(item):
+            if iso:
+                stamp = datetime.fromtimestamp(item, tz=UTC)
+                out[f"{key}_iso"] = stamp.isoformat(timespec="seconds")
+            out[f"{key}_age_days"] = round((now - item) / 86400, 1)
+    return out
+
+
+def _bridge_size(result: dict[str, Any]) -> int:
+    """How long the bridge measures a tool result to be."""
+    return len(json.dumps(result, default=str))
+
+
+def _with_readable_result(raw: dict[str, Any]) -> dict[str, Any]:
+    """Add readable timestamps to a read result; errors and plain text pass through.
+
+    The times add about 4%. They must not push a result that fitted under
+    _BRIDGE_CAP over it, or the model gets the first 10,000 characters instead
+    of all of it, so such a result keeps only the ages, or no times at all.
+    """
+    data = _decoded(raw)
+    if data is None:
+        return raw
+    now = time.time()
+    full = {**raw, "result": _encoded(_with_readable_times(data, now))}
+    if _bridge_size(full) <= _BRIDGE_CAP or _bridge_size(raw) > _BRIDGE_CAP:
+        return full
+    ages = {**raw, "result": _encoded(_with_readable_times(data, now, iso=False))}
+    return ages if _bridge_size(ages) <= _BRIDGE_CAP else raw
+
+
+def _equals_any(wanted: str, names: list[Any]) -> bool:
+    folded = wanted.casefold()
+    return any(isinstance(n, str) and n.casefold() == folded for n in names)
+
+
+def _problem_matches(obj: Any, host: str, service: str) -> bool:
+    """Whether one Host or Service object from get_problems matches the filters.
+
+    Only Icinga object names match, ignoring case: a host on its name, a
+    service on its own name and on its host's (``host_name``, or the part of
+    ``host!service`` before the "!"). The objects monitoring-mcp returns carry
+    no display names, so a dashboard name such as "ocpv07" or "[ODF] OSD Util"
+    never matches here; _miss_hint tells the caller how to resolve it.
+    """
+    if not isinstance(obj, dict):
+        return False
+    attrs = obj.get("attrs") or {}
+    host_part, bang, service_part = str(obj.get("name", "")).partition("!")
+    is_service = obj.get("type") == "Service" or bool(bang)
+    if host:
+        names = [attrs.get("host_name"), host_part]
+        if not is_service:
+            names.append(attrs.get("name"))
+        if not _equals_any(host, names):
+            return False
+    if service:
+        if not is_service:
+            return False
+        if not _equals_any(service, [attrs.get("name"), service_part]):
+            return False
+    return True
+
+
+def _miss_hint(host: str, service: str) -> str:
+    """Say how to resolve a display name after get_problems matched nothing.
+
+    An empty result is also what a healthy host or service gives, so the hint
+    is framed as "if" and says how to find out which it was.
+    """
+    advice = ["No current problem matched these filters."]
+    if host:
+        advice.append(
+            f"If {host!r} is a dashboard display name, look up the Icinga host name with "
+            f"get_hosts search={host!r} and filter on that."
+        )
+    if service:
+        scope = f" and host={host!r}" if host else ""
+        advice.append(
+            f"get_problems matches Icinga service names such as odf_osd_util. If {service!r} "
+            "is a display name, find the service with get_services filter_expr="
+            f"'match(\"*{service}*\", service.display_name)'{scope}."
+        )
+    return " ".join(advice)
+
+
+def _trimmed(value: Any) -> tuple[Any, bool]:
+    """Cut a string or list longer than _CHECK_FIELD_CHARS, saying how much went."""
+    if isinstance(value, str) and len(value) > _CHECK_FIELD_CHARS:
+        cut = len(value) - _CHECK_FIELD_CHARS
+        return f"{value[:_CHECK_FIELD_CHARS]}... [{cut} more characters trimmed]", True
+    if isinstance(value, list):
+        kept: list[Any] = []
+        used = 0
+        for item in value:
+            used += len(json.dumps(item, ensure_ascii=False))
+            if used > _CHECK_FIELD_CHARS:
+                break
+            kept.append(item)
+        if len(kept) < len(value):
+            return [*kept, f"... [{len(value) - len(kept)} of {len(value)} items trimmed]"], True
+    return value, False
+
+
+def _trimmed_problem(obj: Any) -> tuple[Any, bool]:
+    """Copy one get_problems object with its long check-result fields cut short."""
+    attrs = obj.get("attrs") if isinstance(obj, dict) else None
+    if not isinstance(attrs, dict) or not isinstance(attrs.get("last_check_result"), dict):
+        return obj, False
+    check: dict[str, Any] = attrs["last_check_result"]
+    short: dict[str, Any] = {}
+    cut_any = False
+    for key, value in check.items():
+        short[key], cut = _trimmed(value)
+        cut_any = cut_any or cut
+    if not cut_any:
+        return obj, False
+    return {**obj, "attrs": {**attrs, "last_check_result": short}}, True
+
+
+def _fit_problems(
+    layout: dict[str, Any], entries: list[tuple[str, Any]], bare: bool, now: float
+) -> tuple[str, int]:
+    """Render the longest leading run of ``entries`` that fits _PROBLEMS_BUDGET.
+
+    Returns the result text and how many entries it holds. Timestamps get both
+    ``_iso`` and ``_age_days`` unless that would cost an object; then only the
+    ages stay, because a whole problem is worth more than a second rendering
+    of its check time.
+    """
+
+    def render(count: int, iso: bool) -> str:
+        sent = entries[:count]
+        shaped = {
+            key: (
+                [obj for section, obj in sent if section == key] if isinstance(objs, list) else objs
+            )
+            for key, objs in layout.items()
+        }
+        return _encoded(_with_readable_times(shaped[""] if bare else shaped, now, iso))
+
+    def fits(count: int, iso: bool) -> bool:
+        return len(json.dumps(render(count, iso))) <= _PROBLEMS_BUDGET
+
+    for iso in (True, False):
+        if fits(len(entries), iso):
+            return render(len(entries), iso), len(entries)
+    # Size grows with the count, so binary-search the largest count that fits.
+    low, high = 0, len(entries)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if fits(mid, False):
+            low = mid
+        else:
+            high = mid - 1
+    return render(low, False), low
+
+
+def _filter_problems(
+    raw: dict[str, Any], host: str, service: str, filter_expr: str
+) -> dict[str, Any]:
+    """Apply the caller's filters to a get_problems result and bound what is sent.
+
+    ``filter_expr`` is honoured only as a single host or service name equality;
+    anything else is reported back as ignored rather than silently dropped, and
+    so is an equality that disagrees with the ``host`` or ``service`` argument,
+    which wins. The result is bounded by size as well as count: long check
+    output is trimmed and objects past _PROBLEMS_BUDGET are counted, not sent,
+    with ``truncated: true`` whenever anything was left out.
+    """
+    data = _decoded(raw)
+    if data is None:
+        return raw
+
+    notes: list[str] = []
+    if filter_expr:
+        equality = _NAME_EQUALITY.match(filter_expr)
+        if equality is None:
+            notes.append(
+                "get_problems applies only a single host.name or service.name equality, so "
+                "this filter_expr was ignored; use get_services or get_hosts for other filter "
+                "expressions."
+            )
+        else:
+            field, value = equality.group(1), equality.group(3)
+            given = host if field == "host" else service
+            if not given:
+                host, service = (value, service) if field == "host" else (host, value)
+            elif given.casefold() != value.casefold():
+                notes.append(
+                    f"filter_expr names {field} {value!r} but {field}={given!r} was also "
+                    f"given; the {field} argument was used."
+                )
+
+    # The server returns {"hosts": [...], "services": [...]}; a bare list is
+    # handled the same way as a single section.
+    layout = data if isinstance(data, dict) else {"": data}
+    hits = [
+        (key, obj)
+        for key, objs in layout.items()
+        if isinstance(objs, list)
+        for obj in objs
+        if _problem_matches(obj, host, service)
+    ]
+    # Trim before adding readable times, so the budget goes on problems rather
+    # than on perfdata, and so the times are never what gets cut.
+    entries: list[tuple[str, Any]] = []
+    cuts: list[bool] = []
+    for key, obj in hits[:_MAX_PROBLEMS]:
+        short, cut = _trimmed_problem(obj)
+        entries.append((key, short))
+        cuts.append(cut)
+    text, sent = _fit_problems(layout, entries, not isinstance(data, dict), time.time())
+    trimmed = any(cuts[:sent])
+
+    out: dict[str, Any] = {**raw, "result": text}
+    if trimmed or sent < len(hits):
+        out["truncated"] = True
+    if sent < len(hits):
+        out["total_matches"] = len(hits)
+        notes.append(
+            f"Only {sent} of {len(hits)} matching problems are listed; pass host or "
+            "service to narrow the call."
+        )
+    if trimmed:
+        notes.append(
+            f"Check-result fields longer than {_CHECK_FIELD_CHARS} characters were "
+            "trimmed; get_services with host, filter_expr 'service.name == \"<name>\"' "
+            "and detailed=true returns one service's full check result."
+        )
+    if (host or service) and not hits:
+        out["hint"] = _miss_hint(host, service)
+    if notes:
+        out["note"] = " ".join(notes)
+    return out
 
 
 async def _dispatch_write(

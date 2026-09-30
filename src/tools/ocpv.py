@@ -9,6 +9,7 @@ from src.connections.ocpv import (
     get_configured_clusters,
     k8s_get,
     k8s_get_text,
+    k8s_iter_cluster,
     k8s_list_cluster,
     k8s_list_namespaced,
     resolve_cluster_from_comment,
@@ -221,17 +222,22 @@ async def _list_pvcs(cluster: str, namespace: str, name: str, max_results: int) 
 
 
 async def _list_pvs(cluster: str, name: str, max_results: int) -> dict[str, Any]:
-    """List PVs grouped by node and storage class."""
-    result = await k8s_list_cluster(cluster, "", "v1", "persistentvolumes")
-    items = result.get("items", [])
+    """List PVs grouped by node and storage class.
 
-    if name:
-        name_lower = name.lower()
-        items = [i for i in items if name_lower in i["metadata"]["name"].lower()]
+    PVs are cluster-scoped, so they are read a page at a time and folded into
+    the summary as they arrive instead of being held as one list.
+    """
+    # The model can send "name": null, which the dispatcher passes through as
+    # None; treat it as "no filter" like every other action does.
+    name_lower = (name or "").lower()
+    total_pvs = 0
 
     # Group by node + storage class
     summary: dict[str, dict[str, Any]] = {}
-    for item in items:
+    async for item in k8s_iter_cluster(cluster, "", "v1", "persistentvolumes"):
+        if name_lower and name_lower not in item["metadata"]["name"].lower():
+            continue
+        total_pvs += 1
         sc = item.get("spec", {}).get("storageClassName", "unknown")
         status = item.get("status", {}).get("phase", "Unknown")
 
@@ -278,7 +284,7 @@ async def _list_pvs(cluster: str, name: str, max_results: int) -> dict[str, Any]
     return {
         "cluster": cluster,
         "summary": rows[:max_results],
-        "total_pvs": len(items),
+        "total_pvs": total_pvs,
         "total_bound_gi": sum(r["bound_capacity_gi"] for r in rows),
     }
 
@@ -704,11 +710,10 @@ async def _pods_top(cluster: str, namespace: str, name: str, max_results: int) -
     if not namespace:
         return {"error": "namespace is required for pods_top"}
 
-    metrics = await k8s_list_cluster(cluster, "metrics.k8s.io", "v1beta1", "pods")
+    # Namespaced endpoint: the cluster-wide list fetched the metrics of every
+    # pod on the cluster and then kept one namespace.
+    metrics = await k8s_list_namespaced(cluster, "metrics.k8s.io", "v1beta1", "pods", namespace)
     items = metrics.get("items", [])
-
-    # Filter by namespace
-    items = [i for i in items if i["metadata"]["namespace"] == namespace]
 
     if name:
         name_lower = name.lower()

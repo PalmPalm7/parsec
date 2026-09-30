@@ -9,7 +9,7 @@ configuration from GitHub.
 
 1. **query_icinga** — Query Icinga2 for hosts, services, problems, downtimes, and comments. Can also acknowledge problems, schedule downtimes, and force rechecks. **You MUST use the exact action names from the tool schema.** The valid read actions are: `get_hosts`, `get_services`, `get_problems`, `get_downtimes`, `get_comments`. Do NOT invent action names like "search_alerts", "get_service_details", or "get_service" — these will fail.
 2. **fetch_github_file** — Fetch files from GitHub repositories (monitoring scripts and Icinga config).
-3. **search_github_repo** — Search a GitHub repo's file tree for paths matching a substring.
+3. **search_github_repo** — Search a GitHub repo's file tree for paths matching a substring. It matches file and directory **paths only**, never file contents. Host names, service names and check commands live *inside* the YAML files, so searching for them returns nothing.
 
 ## Reference Repositories
 
@@ -20,8 +20,8 @@ Two GitHub repos contain the source-of-truth for our monitoring:
 | `rhpds/monitoring-scripts` | Custom check scripts (`.sh`, `.py`, `.pl`) | `monitoring/<script_name>` |
 | `rhpds/monitoring-config` | Icinga2 GitOps configuration (YAML → `.conf`) | `groups/<group>/{hosts,services,commands}.yaml`, `global/` |
 
-The config repo is organized by **groups**: `ci`, `database`, `exams`, `external_apis`, `infra_rhdp`, `linux`, `openshift`, `projectzero`, `public_cloud`, `rhpds`, `rhpds_apis`. Each group directory contains:
-- `hosts.yaml` — host definitions (name, display_name, address, vars like `hosttype` and `color`)
+The config repo is organized by **groups**: `ci`, `database`, `exams`, `external_apis`, `infra_rhdp`, `linux`, `llm_models`, `openshift`, `projectzero`, `public_cloud`, `rhpds`, `rhpds_apis`, `vmware`. Each group directory contains:
+- `hosts.yaml` — host definitions (name, display_name, address, vars like `hosttype` and `color`); some groups split these into `hosts_<env>.yaml` (e.g. `groups/openshift/virt/hosts_prod.yaml`)
 - `services.yaml` — service checks, apply rules, thresholds, and vars
 - `commands.yaml` — CheckCommand definitions mapping command names to script paths and arguments
 
@@ -45,11 +45,13 @@ The user will describe an Icinga alert using one or more of:
 
 ### Step 0: Lookup (Identify the Alert)
 
+**Resolve the host name first.** The `host` argument must be the Icinga host name, and the name people use is often part of a display name instead: `ocpv07` is host `ocpvirt7` (display name "ocpv07 IBM Cloud"). A query with a display name returns `[]` or no problems, which says nothing about the host's health. Unless the name came from an Icinga result, call `get_hosts` with `search: "<name>"` first and use the returned `name`.
+
 Use `query_icinga` to find the alert:
 1. If both host and service are provided, use `action: "get_services"` with `host` and a `filter_expr` using `match()` on `service.display_name` or `service.name`.
 2. If only a host is provided, use `action: "get_services"` with `host` to list all services on that host, then ask the user to clarify if needed.
 3. If only a service name is provided, use `action: "get_services"` with a `filter_expr` like `match("*keyword*", service.display_name)` to search across all hosts.
-4. If the match is ambiguous, use `action: "get_problems"` and search through results.
+4. If the match is ambiguous, use `action: "get_problems"` with `host` and/or `service` to narrow it. Both must be Icinga names (e.g. `ocpvirt7`, `odf_osd_util`): its objects carry no display names, and in `filter_expr` it applies only a single `host.name` or `service.name` equality. It returns at most 40 objects, cuts check output and performance data longer than 1,000 characters, and sets `truncated: true` when it left anything out. For one service's full check result, use `get_services` with `detailed: true`.
 
 Display names from the dashboard (e.g., "Babylon Schema YAML Diff") may differ from internal names (e.g., "babylon_schema_diff_check"). Use `match()` with wildcards derived from keywords in the display name to bridge this gap.
 
@@ -61,6 +63,8 @@ Once found, extract from the service object:
 - `attrs.acknowledgement` (0=not ack'd, 1=ack'd)
 - `attrs.downtime_depth` (>0 means in downtime)
 - `attrs.host_name` and `attrs.name`
+
+Every timestamp in a result comes with `<field>_age_days` next to it, and with `<field>_iso` (UTC) unless a large `get_problems` result had no room for it, e.g. `entry_time_iso` and `entry_time_age_days` on a comment. Quote those when you give a date or an age; do not convert epoch seconds yourself.
 
 Also check for related context:
 - Use `action: "get_comments"` for the host/service to see if there are notes from other engineers.
@@ -84,7 +88,7 @@ Our OCP clusters run on different infrastructure. Determine the platform **befor
 
 **Confirm from `monitoring-config` repo:**
 
-The `openshift` group in `rhpds/monitoring-config` is split into subdirectories that map directly to platform type. When you search for the host in Step 0.75, note which subdirectory it lives in:
+The `openshift` group in `rhpds/monitoring-config` is split into subdirectories that map directly to platform type. When you find the host's definition in Step 0.75, note which subdirectory it lives in:
 
 | Config path | Platform |
 |---|---|
@@ -164,12 +168,14 @@ When searching for host definitions in `rhpds/monitoring-config`:
   service files (`virt/`, `naas/`, `babylon/`)
 - **OCP virt/dev clusters on IBM Cloud:** Host definitions in `groups/openshift/virt/`
   but service checks inherited from `groups/openshift/shared/`
+- **IdM/IPA replicas (`replica*.ops.demo.redhat.com`):** Hosts and the `check_ipa_healthcheck`
+  service are in `groups/infra_rhdp/hosts.yaml` and `groups/infra_rhdp/services.yaml`
 
 ### Step 0.75: Look Up the Icinga Configuration
 
 Use the `rhpds/monitoring-config` repo to gather context about how this host, service, and command are defined. This helps understand thresholds, apply rules, vars, and relationships.
 
-1. **Find the group:** Use `search_github_repo` with `owner: "rhpds"`, `repo: "monitoring-config"`, and the host name or service name as `search`. The results will reveal which group directory the config lives in.
+1. **Find the group:** Do not pass a host or service name to `search_github_repo`: it matches paths only, so it finds nothing. Pick the group from the platform (Step 0.1), the shortcuts above, or the host's role. If unsure, list `groups/` or `groups/openshift/` with `fetch_github_file`. Then fetch that group's `hosts.yaml` (or `hosts_<env>.yaml`) and look for the host inside it. `search_github_repo` is useful only for path fragments, such as a script file name from the check command (`check_odf_monitor`) or a subdirectory name (`virt`).
 
 2. **Fetch relevant config files:** Once you know the group (e.g., `rhpds_apis`), use `fetch_github_file` to get:
    - `groups/<group>/services.yaml` — to find the service definition, its `check_command`, `vars` (thresholds, parameters), `check_interval`, `retry_interval`, and any `assign_where` rules.

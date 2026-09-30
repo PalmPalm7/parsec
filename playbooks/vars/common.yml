@@ -74,3 +74,42 @@ sdk_enabled_agents: ["all"]
 sdk_orchestrator: true
 sdk_allow_writes: false
 sdk_timeout: 300
+
+# SDK turn budgets, rendered into the ConfigMap's agent.sdk block. The
+# ConfigMap replaces config.yaml wholesale, so these are the only values a
+# deployed pod sees. Without max_turns the orchestrator falls back to
+# anthropic.max_tool_rounds (10): on the 2026-09-30 staging run q11 hit that
+# cap after 400s and $1.66 and answered with its 156-char preamble.
+#
+# sdk_subagent_min_turns is read only by an orchestrator build that has the
+# SDK turn-budget change; there it raises each orchestrated sub-agent's cap to
+# at least this many turns (on that run, sub-agents capped at max_rounds + 3 =
+# 11 returned "Let me..." instead of a report). Code without that change
+# ignores the key, so setting it alone does not raise any cap.
+sdk_max_turns: 30             # orchestrator session
+sdk_subagent_min_turns: 20    # sub-agent cap floor; inert without the turn-budget change
+sdk_turn_timeout: 900         # whole turn, sub-agents included (seconds); 0 disables
+
+# Opt-in NetworkPolicy (parsec-api-ingress) for the app port: only the
+# oauth-proxy pod, the OpenShift router (parsec-health route) and host-network
+# traffic (kubelet probes) may reach 8000. The app takes the caller's identity
+# from X-Forwarded-Email, which only the oauth-proxy sets after a login; with no
+# policy, any pod in the cluster can send that header to parsec-service
+# directly and act as any user. Off until verified on a cluster. Setting it
+# back to false does not remove the object:
+#   oc -n <namespace> delete networkpolicy parsec-api-ingress
+network_policy_enabled: false
+
+# Pod sizing for the parsec container under the SDK runtime. Every turn spawns a
+# `claude` CLI (Node) subprocess next to the app, so the legacy template
+# defaults (512Mi / 500m) are too small. Measured on parsec-dev (2026-09-30):
+# the container sat at its 512Mi limit through every question (cgroup
+# memory.max hit >23,000 times), and a Babylon delegation starved the event
+# loop long enough to fail three liveness probes — the kubelet restarted the
+# pod mid-investigation. The same question completed on a 2-CPU / 3Gi pod.
+# Matches the sizing parsec-sdk-e2e.yaml already uses for this runtime.
+# Override per environment in dev.yml / prod.yml.
+deployment_memory_request: "1Gi"
+deployment_memory_limit: "3Gi"
+deployment_cpu_request: "500m"
+deployment_cpu_limit: "2"
