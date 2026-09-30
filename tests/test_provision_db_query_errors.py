@@ -33,6 +33,18 @@ _TIMEOUT = (
     "(Background on this error at: https://sqlalche.me/e/20/dbapi)"
 )
 
+# Verbatim live text (staging q13, first failed query_provisions_db call). Postgres's
+# HINT names the real column; the model's next call quoted it and succeeded.
+_UNDEFINED_COLUMN_WITH_HINT = (
+    "Query error: (sqlalchemy.dialects.postgresql.asyncpg.ProgrammingError) <class "
+    "'asyncpg.exceptions.UndefinedColumnError'>: column tl.deployerjob does not exist\n"
+    'HINT:  Perhaps you meant to reference the column "tl.deployerJob".\n'
+    "[SQL: \nSELECT \n    tl.deployerJob,\n    tl.towerHost,\n    tl.towerJobURL,\n"
+    "    tl.comments,\n    tl.created_at\nFROM tower_job_log tl\n"
+    "WHERE tl.created_at >= '2026-09-23'::timestamp\nORDER BY tl.created_at DESC\n"
+    "LIMIT 20\n]\n(Background on this error at: https://sqlalche.me/e/20/f405)"
+)
+
 
 def _run(text: str) -> dict:
     with patch("src.connections.reporting_mcp.call_tool", AsyncMock(return_value={"result": text})):
@@ -48,6 +60,41 @@ def test_undefined_column_is_an_error_with_a_hint():
     assert "[SQL:" not in result["error"] and "sqlalche.me" not in result["error"]
     assert "db_describe_table" in result["hint"]
     assert "u.id = p.user_id" in result["hint"] and "ordered_by" in result["hint"]
+
+
+def test_postgres_hint_line_survives_and_the_sql_echo_does_not():
+    result = _run(_UNDEFINED_COLUMN_WITH_HINT)
+    assert result["error"] == (
+        "Query error: (sqlalchemy.dialects.postgresql.asyncpg.ProgrammingError) <class "
+        "'asyncpg.exceptions.UndefinedColumnError'>: column tl.deployerjob does not exist\n"
+        'HINT:  Perhaps you meant to reference the column "tl.deployerJob".'
+    )
+    assert 'Perhaps you meant to reference the column "tl.deployerJob"' in result["error"]
+
+
+def test_detail_lines_are_kept_and_the_parameters_echo_is_dropped():
+    text = (
+        "Query error: (sqlalchemy.dialects.postgresql.asyncpg.ProgrammingError) <class "
+        "'asyncpg.exceptions.UndefinedFunctionError'>: operator does not exist: text = integer\n"
+        "DETAIL:  No operator matches the given name and argument types.\n"
+        "HINT:  You might need to add explicit type casts.\n"
+        "[SQL: SELECT 1 FROM provisions p WHERE p.babylon_guid = 5]\n"
+        "[parameters: ()]\n"
+        "(Background on this error at: https://sqlalche.me/e/20/f405)"
+    )
+    error = _run(text)["error"]
+    assert error.splitlines()[1:] == [
+        "DETAIL:  No operator matches the given name and argument types.",
+        "HINT:  You might need to add explicit type casts.",
+    ]
+
+
+def test_docs_link_is_dropped_when_there_is_no_sql_echo():
+    text = (
+        "Query error: connection was closed\n"
+        "(Background on this error at: https://sqlalche.me/e/20/e3q8)"
+    )
+    assert _run(text) == {"error": "Query error: connection was closed"}
 
 
 def test_statement_timeout_is_an_error_with_a_hint():

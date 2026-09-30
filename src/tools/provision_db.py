@@ -26,6 +26,11 @@ _ROW_COUNT_PATTERN = re.compile(r"(\d+) rows? returned")
 #: The model, ToolStats and the metrics all read that as a successful call.
 _QUERY_ERROR_PREFIX = "Query error:"
 
+#: Where SQLAlchemy's additions to the database's message start: the echoed
+#: statement, and the docs link it writes last (see :func:`_query_error`).
+_SQL_ECHO_START = "[SQL:"
+_DOCS_LINK_START = "(Background on this "
+
 #: What to do next for the database errors the agents actually hit, keyed by the
 #: asyncpg exception class named in the error text.
 _QUERY_ERROR_HINTS = {
@@ -90,10 +95,25 @@ def validate_sql(sql: str) -> str | None:
 def _query_error(text: str) -> dict:
     """Turn a Reporting-MCP ``Query error: ...`` text into an ``{"error"}`` result.
 
-    Keeps only the first line: the rest is SQLAlchemy's echo of the SQL the model
-    just wrote and a link to its docs.
+    Keeps the database's own message, including Postgres's ``HINT:`` and
+    ``DETAIL:`` lines. On the live runs the HINT was the model's quickest fix
+    (``Perhaps you meant to reference the column "tl.deployerJob"``, and the
+    retry with the quoted column worked); keeping only the first line lost it.
+
+    Drops what SQLAlchemy appends after the message, in this order: the echo of
+    the SQL the model just wrote (``[SQL: ...]``, then any ``[parameters: ...]``)
+    and a ``(Background on this error at: <url>)`` docs link. The echoed SQL can
+    hold any text, including a ``]`` at the end of a line, so its end cannot be
+    found reliably: everything from the first line starting with ``[SQL:`` is cut.
     """
-    message = text.strip().splitlines()[0]
+    kept: list[str] = []
+    for line in text.strip().splitlines():
+        if line.startswith(_SQL_ECHO_START):
+            break
+        # Written even when there is no statement to echo.
+        if not line.startswith(_DOCS_LINK_START):
+            kept.append(line)
+    message = "\n".join(kept).strip()
     error: dict[str, str] = {"error": message}
     for exc_name, hint in _QUERY_ERROR_HINTS.items():
         if exc_name in message:
