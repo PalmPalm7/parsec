@@ -207,3 +207,28 @@ def test_capped_anarchy_action_listing_is_not_a_clean_miss(clusters, monkeypatch
     clusters(page_size=10, east=_Cluster(100, make=action))
     result = asyncio.run(tools.query_babylon_catalog("list_anarchy_actions", guid="nomatch"))
     assert result["incomplete"] is True and result["partially_searched_clusters"] == ["east"]
+
+
+def test_anarchy_action_listing_that_fails_partway_is_not_complete(clusters):
+    # Page 1 lists a match, page 2 answers 500: the match is real, the listing is not whole.
+    def action(i: int) -> dict:
+        subject = "x.prod-abcde" if i == 3 else f"y.prod-q{i:04d}"
+        return {
+            "metadata": {"name": f"a{i}", "namespace": _NS},
+            "spec": {"subjectRef": {"name": subject}},
+            "status": {},
+        }
+
+    class _FailsOnPage2(_Cluster):
+        async def get(self, path, params=None):
+            if (params or {}).get("continue"):
+                request = httpx.Request("GET", f"https://api.test{path}")
+                return httpx.Response(500, request=request, json={"kind": "Status"})
+            return await super().get(path, params)
+
+    clusters(page_size=10, east=_FailsOnPage2(20, make=action))
+    result = asyncio.run(
+        tools.query_babylon_catalog("list_anarchy_actions", cluster="east", guid="abcde")
+    )
+    assert result["count"] == 1 and result["errors"]
+    assert result["complete"] is False

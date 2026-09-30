@@ -1592,7 +1592,8 @@ async def _list_anarchy_actions(
         "count": len(filtered),
         "truncated": len(filtered) >= max_results,
         # At the cap the rest of the cluster was never read, so a miss is not a miss.
-        "complete": bool(namespace) or len(all_actions) < _ACTION_SCAN_MAX_ITEMS,
+        # Nor after a failed page: the matches before it are all this result has.
+        "complete": not errors and (bool(namespace) or len(all_actions) < _ACTION_SCAN_MAX_ITEMS),
         "namespaces_searched": namespaces_searched,
         "errors": errors if errors else None,
     }
