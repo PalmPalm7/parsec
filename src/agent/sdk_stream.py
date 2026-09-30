@@ -78,6 +78,9 @@ class SdkEventTranslator:
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._text_parts: list[str] = []
         self._active_agents: dict[str, str] = {}
+        #: (agent_type, final message) for every delegation that returned, kept
+        #: so a turn-limited run can still show what the specialists found.
+        self._agent_reports: list[tuple[str, str]] = []
         self._skills_seen: set[str] = set()
         self._usage: Any | None = None
         self._session_id: str | None = None
@@ -272,6 +275,9 @@ class SdkEventTranslator:
             tool_use_id = getattr(block, "tool_use_id", "")
             agent_type = self._active_agents.pop(tool_use_id, None)
             if agent_type:
+                report = _agent_report_text(getattr(block, "content", None))
+                if report:
+                    self._agent_reports.append((agent_type, report))
                 yield sse_agent_done(agent_type)
 
     def _capture_result(self, message: Any) -> None:
@@ -298,24 +304,55 @@ class SdkEventTranslator:
         msg = self._usage
         if msg is None:
             return "the agent runtime produced no result"
+        # Checked on its own, before is_error: the subtype is what names a
+        # turn-limited run, and finish() keys the partial-findings fallback on
+        # it, so neither may depend on how a given CLI version sets is_error.
+        if self._hit_turn_limit():
+            turns = getattr(msg, "num_turns", None)
+            shown = " (the specialists' findings so far are shown above)"
+            return (
+                f"the investigation hit its turn limit after {turns} turns "
+                "without finishing — raise agent.sdk.max_turns or narrow the question"
+                + (shown if self._agent_reports else "")
+            )
         if not getattr(msg, "is_error", False):
             # A clean run that still said nothing is a failure worth surfacing.
             if not "".join(self._text_parts).strip():
                 return "the agent finished without producing an answer"
             return ""
         subtype = str(getattr(msg, "subtype", "") or "")
-        if subtype == "error_max_turns":
-            turns = getattr(msg, "num_turns", None)
-            return (
-                f"the investigation hit its turn limit after {turns} turns "
-                "without finishing — raise agent.sdk.max_turns or narrow the question"
-            )
         detail = str(getattr(msg, "result", None) or subtype or "unknown error")
         lowered = detail.lower()
         for needles, hint in _CLI_ERROR_HINTS:
             if any(needle in lowered for needle in needles):
                 return f"{hint} (the runtime said: {detail})"
         return f"the agent runtime failed: {detail}"
+
+    def _hit_turn_limit(self) -> bool:
+        return (
+            not self._forced_failure
+            and self._usage is not None
+            and getattr(self._usage, "subtype", None) == "error_max_turns"
+        )
+
+    def _partial_findings(self) -> str:
+        """The specialists' reports, for a run that ran out of turns.
+
+        The orchestrator's text is then usually a preamble: on the live staging
+        pod q11 ended at the orchestrator's turn limit with the 156 characters
+        "…Delegating to the Babylon agent to investigate." while its sub-agents
+        had already resolved 2w27z to a ResourceClaim. Their reports are the only
+        findings the turn produced, so they are kept rather than discarded.
+        """
+        if not self._hit_turn_limit() or not self._agent_reports:
+            return ""
+        from src.agent.agents import AGENTS
+
+        parts = ["\n\n## Partial findings (turn limit reached)\n"]
+        for agent_type, report in self._agent_reports:
+            cfg = AGENTS.get(agent_type)
+            parts.append(f"\n### {cfg.name if cfg else agent_type}\n\n{report}\n")
+        return "".join(parts)
 
     def fail(self, reason: str) -> None:
         """Record why the caller stopped this run; :meth:`finish` reports it once."""
@@ -329,7 +366,12 @@ class SdkEventTranslator:
         ``history`` must precede ``done``: the browser's ``saveConversation()``
         runs on it, and without it the answer is lost on refresh.
         """
-        from src.agent.streaming import sse_done, sse_event
+        from src.agent.streaming import sse_done, sse_event, sse_text
+
+        partial = self._partial_findings()
+        if partial:
+            self._text_parts.append(partial)
+            yield sse_text(partial)
 
         answer = "".join(self._text_parts).strip()
         self._record_metrics(collector)
@@ -420,6 +462,27 @@ def _turn_tokens(result: Any) -> dict[str, int]:
         entries = [usage] if isinstance(usage, dict) else []
         fields = _USAGE_FIELDS
     return {ours: sum(int(e.get(theirs) or 0) for e in entries) for ours, theirs in fields.items()}
+
+
+def _agent_report_text(content: Any) -> str:
+    """A delegation's tool_result reduced to the sub-agent's final message.
+
+    The CLI appends a block of its own after the report ("agentId: … (use
+    SendMessage … to continue this agent)" plus a ``<usage>`` footer). It is
+    meaningless to a reader, and SendMessage is not available here, so it is
+    dropped.
+    """
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        text = block.get("text") if isinstance(block, dict) else None
+        if not isinstance(text, str) or text.lstrip().startswith("agentId:"):
+            continue
+        parts.append(text.strip())
+    return "\n\n".join(p for p in parts if p)
 
 
 def _flatten_content(content: Any) -> str:
