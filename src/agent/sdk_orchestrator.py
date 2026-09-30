@@ -257,7 +257,8 @@ def build_orchestrator_options(config: Any, *, system: str) -> Any:
     # reach: the orchestrator could call every specialist tool itself, and on
     # the live pods it did instead of delegating. Sub-agents are narrowed by
     # `AgentDefinition.tools` (see `_agent_definitions`); the main thread is
-    # narrowed to its own direct tools by the PreToolUse guard in sdk_hooks.
+    # narrowed to its own direct tools by the PreToolUse guard in sdk_hooks,
+    # which also keeps every Parsec tool from the CLI's built-in agent types.
     approved_tools = tool_names_for(schemas)
     direct_tools = tool_names_for(get_orchestrator_direct_tools())
 
@@ -286,11 +287,12 @@ def build_orchestrator_options(config: Any, *, system: str) -> Any:
         max_turns=max_turns,
         agents=agents,
         # Warns each sub-agent before its maxTurns, as the legacy loop does, and
-        # keeps specialist tools off the main thread.
+        # keeps specialist tools off the main thread and out of built-in agents.
         hooks=build_hooks(
             turn_limits={name: d.maxTurns for name, d in agents.items() if d.maxTurns},
             direct_tools=direct_tools,
             tool_owners=_tool_owners(agents),
+            specialists=agents,
         ),
         mcp_servers={SERVER_NAME: server},
         allowed_tools=[*approved_tools, *_ORCHESTRATOR_EXTRA_TOOLS],

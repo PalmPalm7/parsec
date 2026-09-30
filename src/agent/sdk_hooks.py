@@ -35,11 +35,16 @@ driving the pinned CLI 2.1.169 (and the wheel's bundled 2.1.185):
   CLI keeps flushing while it waits for a hook's answer.
 
 The second hook here uses that: the orchestrator's main thread may call only
-its own direct tools and the generic GitHub reads. Every bridged tool is approved session-wide so that
-sub-agents can use theirs, and on the live pods the orchestrator used that
-approval to skip delegation — dev q03 ran ``query_gcp_projects`` itself, so
-the cost agent and its spend workflow never loaded; dev q06 ran
-``query_babylon_catalog`` inline; staging q04 ran ``query_azure_pools``.
+its own direct tools and the generic GitHub reads, and only Parsec's own
+specialists may call Parsec tools at all. Every bridged tool is approved
+session-wide so that sub-agents can use theirs, and on the live pods the
+orchestrator used that approval to skip delegation — dev q03 ran
+``query_gcp_projects`` itself, so the cost agent and its spend workflow never
+loaded; dev q06 ran ``query_babylon_catalog`` inline; staging q04 ran
+``query_azure_pools``. The CLI also offers its built-in agent types
+(``general-purpose``, ``Explore``, ``Plan``…; ``general-purpose`` has every
+tool), so ``Agent(subagent_type="general-purpose")`` would run the same tools
+one hop removed, without the specialist's prompt or skills.
 """
 
 from __future__ import annotations
@@ -250,38 +255,67 @@ def budget_warning_hook(
 
 
 def delegation_guard_hook(
-    direct_tools: Iterable[str], tool_owners: Mapping[str, Sequence[str]]
+    direct_tools: Iterable[str],
+    tool_owners: Mapping[str, Sequence[str]],
+    specialists: Iterable[str],
 ) -> HookCallback:
-    """A pre-tool hook that refuses specialist tools on the orchestrator's thread.
+    """A pre-tool hook that keeps Parsec tools with the agents meant to run them.
 
     ``direct_tools`` are the ``mcp__parsec__*`` names the orchestrator may call
     itself; ``tool_owners`` maps every other bridged name to the sub-agents that
     have it, so the refusal can say where to delegate. The Reporting-MCP
     ``db_*`` tools are always the orchestrator's own, including any discovered
     after ``direct_tools`` was computed, and so are ``MAIN_THREAD_READ_TOOLS``.
-    Inside a sub-agent nothing is refused:
-    ``AgentDefinition.tools`` already scopes what each one can reach.
+
+    ``specialists`` are the enabled custom ``agent_type`` names. Inside one of
+    them nothing is refused, because its ``AgentDefinition.tools`` already
+    scopes what it can reach. That is not true of the CLI's built-in agent
+    types, which no ``AgentDefinition`` narrows, so a sub-agent of any other
+    type (or with no type) gets no Parsec tool at all.
     """
     from src.agent.parsec_mcp import SERVER_NAME
 
     prefix = f"mcp__{SERVER_NAME}__"
     allowed = frozenset(direct_tools)
+    custom = frozenset(specialists)
+
+    def _orchestrators(name: str, short: str) -> bool:
+        return name in allowed or short.startswith("db_") or short in MAIN_THREAD_READ_TOOLS
+
+    def _delegate_to(name: str) -> str:
+        owners = list(tool_owners.get(name) or ())
+        targets = " or ".join(f'subagent_type="{o}"' for o in owners)
+        return f"the Agent tool ({targets})" if owners else ""
 
     async def _hook(input_data: Any, tool_use_id: str | None, context: Any) -> dict[str, Any]:
-        if input_data.get("agent_id"):
-            return {}
         name = str(input_data.get("tool_name") or "")
-        if not name.startswith(prefix) or name in allowed:
+        if not name.startswith(prefix):
             return {}
         short = name[len(prefix) :]
-        if short.startswith("db_") or short in MAIN_THREAD_READ_TOOLS:
+        target = _delegate_to(name)
+        if input_data.get("agent_id"):
+            agent_type = str(input_data.get("agent_type") or "")
+            if agent_type in custom:
+                return {}
+            if _orchestrators(name, short):
+                where = "the orchestrator can call it itself"
+            elif target:
+                where = f"the orchestrator should delegate with {target}"
+            else:
+                where = "no specialist that uses it is enabled on this deployment"
+            reason = (
+                f"`{short}` is a Parsec tool, and only Parsec's own specialists may call "
+                f"it; `{agent_type or 'this agent'}` is not one. Do not retry: report "
+                f"back that {where}."
+            )
+            logger.info("SDK orchestrator: refused %s in a %r sub-agent", short, agent_type)
+            return _deny(reason)
+        if _orchestrators(name, short):
             return {}
-        owners = list(tool_owners.get(name) or ())
-        if owners:
-            targets = " or ".join(f'subagent_type="{o}"' for o in owners)
+        if target:
             reason = (
                 f"`{short}` is a specialist tool; you cannot call it yourself. Delegate "
-                f"with the Agent tool ({targets}) and pass the facts you already have."
+                f"with {target} and pass the facts you already have."
             )
         else:
             reason = (
@@ -290,15 +324,19 @@ def delegation_guard_hook(
                 "this could not be checked."
             )
         logger.info("SDK orchestrator: refused %s on the main thread", short)
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
-        }
+        return _deny(reason)
 
     return cast("HookCallback", _hook)
+
+
+def _deny(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
 
 
 def build_hooks(
@@ -306,6 +344,7 @@ def build_hooks(
     turn_limits: Mapping[str, int],
     direct_tools: Iterable[str],
     tool_owners: Mapping[str, Sequence[str]],
+    specialists: Iterable[str],
 ) -> dict[HookEvent, list[HookMatcher]]:
     """The ``ClaudeAgentOptions.hooks`` mapping for one orchestrator turn."""
     from claude_agent_sdk import HookMatcher
@@ -314,5 +353,6 @@ def build_hooks(
     hooks: dict[HookEvent, list[HookMatcher]] = {
         event: [HookMatcher(hooks=[budget])] for event in _POST_TOOL_EVENTS
     }
-    hooks["PreToolUse"] = [HookMatcher(hooks=[delegation_guard_hook(direct_tools, tool_owners)])]
+    guard = delegation_guard_hook(direct_tools, tool_owners, specialists)
+    hooks["PreToolUse"] = [HookMatcher(hooks=[guard])]
     return hooks

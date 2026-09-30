@@ -113,6 +113,49 @@ async def test_nothing_is_refused_inside_a_subagent(_sdk_stub, tool, agent_type)
 @pytest.mark.parametrize("tool", ["Agent", "Skill", "ToolSearch"])
 async def test_builtin_tools_are_not_the_guards_business(_sdk_stub, tool):
     assert await _decide(_guard(), _pre(tool)) == (None, "")
+    assert await _decide(_guard(), _pre(tool, "general-purpose")) == (None, "")
+
+
+@pytest.mark.parametrize("agent_type", ["general-purpose", "Explore", "Plan", "claude"])
+@pytest.mark.parametrize(
+    "tool", ["query_gcp_projects", "query_provisions_db", "db_query", "fetch_github_file"]
+)
+async def test_builtin_agent_types_get_no_parsec_tools(_sdk_stub, agent_type, tool):
+    """The CLI (2.1.169) also offers these, and general-purpose has tools ["*"].
+
+    Without this, Agent(subagent_type="general-purpose") runs any specialist tool
+    without the specialist's prompt or skills: the main-thread bypass, one hop out.
+    """
+    decision, reason = await _decide(_guard(), _pre(f"mcp__parsec__{tool}", agent_type))
+
+    assert decision == "deny"
+    assert f"`{agent_type}` is not one" in reason
+
+
+async def test_builtin_agent_refusal_says_where_the_work_belongs(_sdk_stub):
+    guard = _guard()
+
+    _, specialist = await _decide(guard, _pre("mcp__parsec__query_gcp_projects", "Explore"))
+    _, direct = await _decide(guard, _pre("mcp__parsec__query_provisions_db", "Explore"))
+
+    assert 'subagent_type="cost"' in specialist
+    assert "orchestrator can call it itself" in direct
+
+
+async def test_a_subagent_without_a_type_gets_no_parsec_tools(_sdk_stub):
+    data = _pre("mcp__parsec__query_gcp_projects", "cost")
+    del data["agent_type"]
+
+    decision, _ = await _decide(_guard(), data)
+    assert decision == "deny"
+
+
+async def test_a_specialist_that_is_not_enabled_gets_no_parsec_tools(_sdk_stub):
+    guard = _guard(["icinga"])
+
+    assert await _decide(guard, _pre("mcp__parsec__query_icinga", "icinga")) == (None, "")
+    decision, _ = await _decide(guard, _pre("mcp__parsec__query_gcp_projects", "cost"))
+    assert decision == "deny"
 
 
 async def test_refusal_does_not_name_a_specialist_that_is_not_enabled(_sdk_stub):
