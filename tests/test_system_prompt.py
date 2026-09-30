@@ -174,3 +174,13 @@ def test_rate_limit_fallback_uses_a_table_that_joins_to_provisions(agent_type: s
     fallback = _flat(prompt[prompt.index("**AAP2 quota exceeded (429):**") :].split("\n- ")[0])
     assert "(`provision_job` for each action's job" in fallback
     assert "direct database queries (`tower_job_log`" not in fallback
+
+
+def test_pitfalls_say_tower_job_id_is_the_provision_job_only() -> None:
+    # tower_job_id matched the provision-action job 1274/1274 times and a
+    # stop/start/destroy job 0/1633 times; a provision also has many stop/start runs.
+    pitfalls = get_agent_prompt("orchestrator")
+    pitfalls = _flat(pitfalls[pitfalls.index("## Provision Database: Column Pitfalls") :])
+    assert "`tower_job_url` is the `provision` action's job only" in pitfalls
+    assert "one row per action run: filter on `action`" in pitfalls
+    assert "one row per `action`" not in pitfalls

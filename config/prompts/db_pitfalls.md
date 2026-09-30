@@ -22,10 +22,11 @@ reference. If unsure, call `db_describe_table` to check. Common mistakes:
   which does not exist. Every other column in both tables is lowercase snake_case and
   is written unquoted — e.g. `provision_uuid`, `action`, `runtime_hour`,
   `extra_vars_json`, `created_at`.
-- `tower_job_log` has NO `provision_uuid` and does not join to provisions. A
-  provision's own AAP2 job is `provisions.tower_job_id` / `tower_job_url`; its
-  per-action jobs are in `provision_job` (`pj.provision_uuid = p.uuid`, one row per
-  `action`).
+- `tower_job_log` has NO `provision_uuid` and does not join to provisions.
+  `provisions.tower_job_id` / `tower_job_url` is the `provision` action's job only —
+  never the stop, start or destroy job. Every action's jobs are in `provision_job`
+  (`pj.provision_uuid = p.uuid`, one row per action run: filter on `action` and take
+  the newest `"startTimestamp"`).
 - `resource_claim_log` has no `id` column — its key is `provision_uuid`.
 - A GUID that matches no `babylon_guid` may be the suffix of a ResourceClaim name:
   the GUID of the ordered catalog item, while the provision row carries its
