@@ -127,6 +127,9 @@ class SdkEventTranslator:
         from src.agent.streaming import sse_text
 
         event = getattr(message, "event", None) or {}
+        if event.get("type") == "content_block_start":
+            yield from self._separate_text_block(message, event)
+            return
         if event.get("type") != "content_block_delta":
             return
         delta = event.get("delta") or {}
@@ -141,6 +144,26 @@ class SdkEventTranslator:
             return
         self._text_parts.append(chunk)
         yield sse_text(chunk)
+
+    def _separate_text_block(self, message: Any, event: dict) -> Iterator[str]:
+        """Start each top-level text block on a new paragraph.
+
+        The orchestrator's narration before a tool call and its answer after it
+        are separate text blocks, and their deltas were joined as they arrived.
+        On the live pods that produced "…in parallel.## GCP Open Environment",
+        in the streamed answer and in the saved history alike.
+        """
+        from src.agent.streaming import sse_text
+
+        block = event.get("content_block") or {}
+        if block.get("type") != "text" or getattr(message, "parent_tool_use_id", None):
+            return
+        so_far = "".join(self._text_parts)
+        if not so_far.strip() or so_far.endswith("\n\n"):
+            return
+        separator = "\n" if so_far.endswith("\n") else "\n\n"
+        self._text_parts.append(separator)
+        yield sse_text(separator)
 
     def _translate_assistant(self, message: Any) -> Iterator[str]:
         from claude_agent_sdk import ToolUseBlock
