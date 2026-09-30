@@ -227,7 +227,9 @@ async def _list_pvs(cluster: str, name: str, max_results: int) -> dict[str, Any]
     PVs are cluster-scoped, so they are read a page at a time and folded into
     the summary as they arrive instead of being held as one list.
     """
-    name_lower = name.lower()
+    # The model can send "name": null, which the dispatcher passes through as
+    # None; treat it as "no filter" like every other action does.
+    name_lower = (name or "").lower()
     total_pvs = 0
 
     # Group by node + storage class

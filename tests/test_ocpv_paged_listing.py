@@ -89,6 +89,17 @@ async def test_list_pvs_name_filter_applies_on_every_page(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_pvs_null_name_means_no_filter(monkeypatch):
+    """A tool call with "name": null reaches _list_pvs as None: list everything, not an error."""
+    _install(monkeypatch, [_pv(i) for i in range(3)])
+
+    result = await tools.query_ocpv_cluster(action="list_pvs", cluster="ocpv07", name=None)
+
+    assert "error" not in result
+    assert result["total_pvs"] == 3
+
+
+@pytest.mark.asyncio
 async def test_pods_top_asks_for_one_namespace(monkeypatch):
     pod = {
         "metadata": {"name": "virt-launcher-vm1-abcde", "namespace": "sandbox-1"},
