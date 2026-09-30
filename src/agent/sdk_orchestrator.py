@@ -394,7 +394,7 @@ async def run_agent_via_sdk(
     event names, same ordering, same terminating ``history`` + ``done`` pair, so
     ``routes/query.py`` and the frontend are unchanged.
     """
-    from src.agent.parsec_mcp import sse_sink
+    from src.agent.parsec_mcp import ToolStats, sse_sink, tool_stats
     from src.agent.sdk_stream import SdkEventTranslator
     from src.agent.streaming import sse_done, sse_error
     from src.config import get_config
@@ -402,6 +402,9 @@ async def run_agent_via_sdk(
 
     cfg = get_config()
     collector = MetricsCollector(conversation_id=conversation_id or session_id or "")
+    # Without this the flush's stop_timer() has nothing to measure from, and
+    # every SDK turn reached MLflow with total_latency_ms=0.
+    collector.start_timer()
     collector.record_runtime("sdk")
     collector.record_agent_dispatch("orchestrator", routing_method="sdk")
 
@@ -440,6 +443,8 @@ async def run_agent_via_sdk(
         return left
 
     token = sse_sink.set(translator.push)
+    stats = ToolStats()
+    stats_token = tool_stats.set(stats)
     try:
         from claude_agent_sdk import ClaudeSDKClient
 
@@ -472,7 +477,10 @@ async def run_agent_via_sdk(
         yield sse_error(str(e))
     finally:
         sse_sink.reset(token)
+        tool_stats.reset(stats_token)
         _tool_cache.reset(cache_token)
 
+    collector.tool_calls += stats.calls
+    collector.tool_errors += stats.errors
     for event in translator.finish(collector):
         yield event

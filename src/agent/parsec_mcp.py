@@ -36,6 +36,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,21 @@ SERVER_NAME = "parsec"
 sse_sink: ContextVar[Callable[[str], Awaitable[None]] | None] = ContextVar(
     "parsec_mcp_sse_sink", default=None
 )
+
+
+@dataclass
+class ToolStats:
+    """Tool calls made through the bridge during one turn, and how many failed."""
+
+    calls: int = 0
+    errors: int = 0
+
+
+#: Per-turn tool accounting, set by the caller alongside :data:`sse_sink` (and
+#: with the same before-``create_task`` rule). The SDK runs the tool loop itself,
+#: so this bridge is the only place Parsec sees each call — without it the SDK
+#: path reported ``tool_calls=0`` to MLflow for every turn, however many it made.
+tool_stats: ContextVar[ToolStats | None] = ContextVar("parsec_mcp_tool_stats", default=None)
 
 #: The only state-mutating surface Parsec exposes. These are enum values of the
 #: ``action`` argument on a single ``query_icinga`` tool, not separate tools, so
@@ -133,8 +149,12 @@ def _make_handler(name: str, allow_writes: bool) -> Callable[[dict], Awaitable[d
     """
 
     async def _handler(args: dict, _name: str = name) -> dict:
+        stats = tool_stats.get()
         refusal = _refuse_write(_name, args, allow_writes)
         if refusal is not None:
+            if stats is not None:
+                stats.calls += 1
+                stats.errors += 1
             return refusal
 
         sink = sse_sink.get()
@@ -142,6 +162,10 @@ def _make_handler(name: str, allow_writes: bool) -> Callable[[dict], Awaitable[d
             await _emit(sink, "tool_start", _name, args)
 
         result = await _dispatch_cached(_name, args)
+        if stats is not None:
+            stats.calls += 1
+            if isinstance(result, dict) and "error" in result:
+                stats.errors += 1
 
         if sink is not None:
             await _emit(sink, "tool_result", _name, result)

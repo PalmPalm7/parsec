@@ -324,6 +324,9 @@ class SdkEventTranslator:
             model = getattr(self._usage, "model", None)
             if model and not getattr(collector, "model", None):
                 collector.record_model(model)
+            # The legacy loop sets a turn status; the SDK path left it blank, so
+            # failed SDK turns were indistinguishable from successful ones in MLflow.
+            collector.status = "error" if self._failure_reason() else "success"
         except Exception:
             logger.exception("Failed to record SDK orchestrator metrics")
 
