@@ -126,6 +126,41 @@ def test_a_scan_that_reaches_the_end_is_complete(clusters):
     clusters(page_size=10, east=_Cluster(25))
     result = _query(cluster="east", guid="nomatch")
     assert result["count"] == 0 and result["complete"] is True and "note" not in result
+    assert "incomplete" not in result
+
+
+def _in_namespace(namespace: str, name: str, guid: str) -> dict:
+    return {
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {"vars": {"job_vars": {"guid": guid}}},
+        "status": {"towerJobs": {}},
+    }
+
+
+@pytest.mark.parametrize("cluster", ["east", ""], ids=["one_cluster", "all_clusters"])
+def test_a_guid_hit_from_a_stopped_scan_says_other_components_may_exist(clusters, cluster):
+    # Staging q11: GUID 7vp2w has three AnarchySubjects, in babylon-anarchy-0, -2 and -5.
+    # A cluster-wide list is ordered by namespace, so they are on different pages and
+    # the scan stops after the first one.
+    items = [
+        _in_namespace(f"babylon-anarchy-{n}", f"filler.item.prod-f{n}{j:03d}", f"f{n}{j:03d}")
+        for n in range(6)
+        for j in range(30)
+    ] + [
+        _in_namespace("babylon-anarchy-0", "enterprise.aap-demos.prod-7vp2w-2", "7vp2w-2"),
+        _in_namespace("babylon-anarchy-2", "agd-v2.ocp-cluster-cnv-pools.prod-7vp2w", "7vp2w"),
+        _in_namespace("babylon-anarchy-5", "sandboxes-gpte.sandbox-open.prod-7vp2w-1", "7vp2w-1"),
+    ]
+    east = _Cluster()
+    east.items = sorted(items, key=lambda i: (i["metadata"]["namespace"], i["metadata"]["name"]))
+    clusters(page_size=10, east=east)
+
+    result = _query(cluster=cluster, guid="7vp2w")
+
+    assert [s["name"] for s in result["subjects"]] == ["enterprise.aap-demos.prod-7vp2w-2"]
+    assert result["incomplete"] is True and result["complete"] is False
+    assert "other AnarchySubjects" in result["note"]
+    assert "anarchy_subject_namespace" in result["note"]
 
 
 def test_name_and_namespace_is_one_get(clusters):
@@ -134,6 +169,7 @@ def test_name_and_namespace_is_one_get(clusters):
     name = "agd-v2.rhacs-demo-cnv.prod-g04321"
     result = _query(cluster="east", name=name, namespace=_NS)
     assert [s["name"] for s in result["subjects"]] == [name]
+    assert "incomplete" not in result
     assert east.requests == [
         (f"/apis/anarchy.gpte.redhat.com/v1/namespaces/{_NS}/anarchysubjects/{name}", {})
     ]
@@ -232,3 +268,15 @@ def test_anarchy_action_listing_that_fails_partway_is_not_complete(clusters):
     )
     assert result["count"] == 1 and result["errors"]
     assert result["complete"] is False
+
+
+def test_babylon_prompt_reads_incomplete_on_a_hit_as_other_components_may_exist():
+    # The flag above only helps if the agent acts on it. Rule 7 used to say a result was
+    # unverified only when it "finds nothing", so one hit with complete: false read as
+    # the whole answer.
+    from src.agent.system_prompt import get_agent_prompt
+
+    prompt = get_agent_prompt("babylon")
+    rule = prompt.split("7. **An incomplete search", 1)[1].split("\n## ", 1)[0]
+    assert "incomplete: true" in rule and "complete: false" in rule
+    assert "Found something:** other components may exist" in rule

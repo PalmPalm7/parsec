@@ -1139,10 +1139,17 @@ async def _scan_subjects_cluster_wide(
     """Page through a cluster's AnarchySubjects; ``keep`` appends matches to ``filtered``.
 
     One page at a time, stopping once enough have matched: the whole list on a
-    production cluster is thousands of objects. A GUID names one provision, so
-    a GUID scan also ends with the page its first match is on (the rest of that
-    page is already in memory); a miss used to read every page of every
-    cluster. No scan examines more than :data:`_SUBJECT_SCAN_MAX_ITEMS` objects.
+    production cluster is thousands of objects. A GUID scan also ends with the
+    page its first match is on (the rest of that page is already in memory); a
+    miss used to read every page of every cluster. No scan examines more than
+    :data:`_SUBJECT_SCAN_MAX_ITEMS` objects.
+
+    Stopping at the first match has a price: the list is ordered by namespace,
+    and a provision's other components (the ``-1``/``-2`` subjects of the same
+    GUID) are often in other babylon-anarchy-* namespaces, on pages this scan
+    never reads. Staging q11's GUID 7vp2w had three, in babylon-anarchy-0, -2
+    and -5. So a stopped scan is not complete, and its note says where the
+    others are listed.
 
     Returns ``(complete, note)``: whether every subject on the cluster was
     examined, and if not, why.
@@ -1166,8 +1173,12 @@ async def _scan_subjects_cluster_wide(
                 stop_at = ((examined - 1) // page_size + 1) * page_size
         if stop_at and examined >= stop_at:
             return False, (
-                "Stopped after the page with the first GUID match. A provision's other "
-                "components are listed on its ResourceClaim (get_deployment)."
+                "Stopped after the page with the first GUID match, so other AnarchySubjects "
+                "with this GUID may exist on pages that were not read: a provision's -1/-2 "
+                "components are often in other babylon-anarchy-* namespaces. The provisions "
+                "rows for this GUID give each one's anarchy_subject_name and "
+                "anarchy_subject_namespace; look them up by name + namespace, or repeat "
+                "this search with namespace set."
             )
 
     if examined < _SUBJECT_SCAN_MAX_ITEMS:
@@ -1271,6 +1282,12 @@ async def _list_anarchy_subjects(
         "namespaces_searched": namespaces_searched,
         "errors": errors if errors else None,
     }
+    if not complete:
+        # Top level, next to what was found: complete: false alone read as "the
+        # scan was capped", so one match from a scan that stopped early passed
+        # for the whole answer while the provision's other components were on
+        # pages it never read.
+        out["incomplete"] = True
     if note:
         out["note"] = note
     return out

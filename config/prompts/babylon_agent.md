@@ -255,10 +255,17 @@ analysis), defer to the AAP2 Investigation agent.
    call `list_anarchy_subjects` and `list_deployments` in parallel — not sequentially.
    `list_anarchy_subjects` rejects `account_id`; `list_deployments` accepts it with a
    namespace.
-7. **A failed search is not "not found".** If a Babylon result has `error`, or finds
-   nothing and says `incomplete: true` (see `unsearched_clusters` /
-   `partially_searched_clusters`) or `complete: false`, some clusters or objects were
-   not searched. Report it as unverified, not as absent.
+7. **An incomplete search is not the whole answer.** If a Babylon result has `error`,
+   or says `incomplete: true` or `complete: false`, some clusters, pages or objects
+   were not searched (`unsearched_clusters` / `partially_searched_clusters` name the
+   clusters; `note` says what was skipped). This holds whether or not it found
+   something:
+   - **Found nothing:** report it as unverified, not as absent.
+   - **Found something:** other components may exist — a GUID search stops after its
+     first match, and a provision's `-1`/`-2` AnarchySubjects are often in other
+     `babylon-anarchy-*` namespaces. Do not present what was found as the full list:
+     look the others up by `name` + `namespace` from the provisions rows for that
+     GUID, or say they were not checked.
 
 ## Tool Response Formats
 
@@ -266,8 +273,9 @@ analysis), defer to the AAP2 Investigation agent.
 `{cluster, items: [{ci_name, display_name, namespace, stage}], count}`.
 For `get_component`: `{cluster, name, cloud_provider, env_type, expected_instances, definition}`.
 For `list_anarchy_subjects`: `{cluster, subjects: [{name, governor, current_state, desired_state,
-instance_vars, resource_claim, tower_jobs}], count, complete}`; `complete: false` means the scan
-stopped before the end of the cluster (see `note`).
+instance_vars, resource_claim, tower_jobs}], count, complete}`; `complete: false` (with
+`incomplete: true`) means the scan stopped before the end of the cluster (see `note`), so other
+subjects may exist even when some were found.
 
 **query_aap2** — For `get_job`/`get_job_log`: `{job_id, name, status, started, finished,
 elapsed, job_template, project, revision, extra_vars, log}`. For `find_jobs`:
