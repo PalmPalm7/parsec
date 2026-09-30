@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -35,6 +36,27 @@ _PRICING_USD_PER_TOKEN: dict[str, tuple[float, float]] = {
 _DEFAULT_PRICING_USD_PER_TOKEN = (3e-6, 15e-6)  # assume Sonnet-class when unknown
 _CACHE_WRITE_MULTIPLIER = 1.25
 _CACHE_READ_MULTIPLIER = 0.10
+
+#: The image's commit, read on first use by :func:`build_version`.
+_build_version: str | None = None
+
+
+def build_version() -> str:
+    """The running image's git commit, 12 characters, or "" when unknown.
+
+    OpenShift's source build bakes ``OPENSHIFT_BUILD_COMMIT`` into the image.
+    The e2e run found staging serving an August image that was not the code
+    under test (F8), and neither the usage line nor MLflow said which image
+    produced a turn. The full commit is logged the first time it is read.
+    That is the first turn rather than startup: app.py configures logging
+    after this module is imported, so an import-time line would be dropped.
+    """
+    global _build_version
+    if _build_version is None:
+        commit = os.environ.get("OPENSHIFT_BUILD_COMMIT", "").strip()
+        _build_version = commit[:12]
+        logger.info("Parsec build commit: %s", commit or "unknown (OPENSHIFT_BUILD_COMMIT unset)")
+    return _build_version
 
 
 @dataclass
@@ -178,6 +200,7 @@ class MetricsCollector:
                 "status": self.status,
                 "runtime": self.runtime,
                 "sub_agents": self.sub_agents,
+                "version": build_version(),
             }.items()
             if v
         }
@@ -212,14 +235,15 @@ class MetricsCollector:
         integration) matches "usage runtime=… agent=… in=… … cost_usd=…" as one
         regex. The conversation id and status are on the end: without them, costs
         from the e2e run had to be paired with questions by log adjacency, and
-        an overlapping request made that ambiguous.
+        an overlapping request made that ambiguous. ``version`` ties the line to
+        the image that produced it.
         """
         cached_in = self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
         hit_pct = (self.cache_read_tokens / cached_in * 100) if cached_in else 0.0
         logger.info(
             "usage runtime=%s agent=%s in=%d out=%d cache_read=%d cache_write=%d "
             "cache_hit=%.1f%% tools=%d errors=%d cost_usd=%.4f latency_ms=%.0f "
-            "conversation_id=%s status=%s sub_agents=%s",
+            "conversation_id=%s status=%s version=%s sub_agents=%s",
             self.runtime or "-",
             self.agent_type or "-",
             self.input_tokens,
@@ -233,6 +257,7 @@ class MetricsCollector:
             self.total_latency_ms,
             self.conversation_id or "-",
             self.status or "-",
+            build_version() or "-",
             self.sub_agents or "-",
         )
 

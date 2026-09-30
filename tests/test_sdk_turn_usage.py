@@ -175,6 +175,56 @@ def test_usage_line_keeps_its_head_and_carries_conversation_id_and_status(caplog
     assert fields["sub_agents"] == "aap2,babylon"
 
 
+#: The commit staging's istag carried during the e2e run (REPORT F8).
+_STAGING_COMMIT = "692ab8548f0e1d2c3b4a5968778695a4b3c2d1e0"
+
+
+@pytest.fixture
+def build_commit(monkeypatch):
+    """Set or clear OPENSHIFT_BUILD_COMMIT and forget any value read earlier."""
+    import src.metrics.collector as collector_mod
+
+    def set_commit(value: str | None) -> None:
+        monkeypatch.setattr(collector_mod, "_build_version", None, raising=False)
+        if value is None:
+            monkeypatch.delenv("OPENSHIFT_BUILD_COMMIT", raising=False)
+        else:
+            monkeypatch.setenv("OPENSHIFT_BUILD_COMMIT", value)
+
+    return set_commit
+
+
+def _fields(line: str) -> dict[str, str]:
+    return dict(kv.split("=", 1) for kv in line.split("usage ", 1)[1].split() if "=" in kv)
+
+
+def test_usage_line_and_mlflow_name_the_image_commit(caplog, build_commit):
+    build_commit(_STAGING_COMMIT)
+    c = MetricsCollector(conversation_id="conv-q13", runtime="sdk")
+
+    assert _fields(_usage_line(caplog, c))["version"] == "692ab8548f0e"
+    assert c.to_params()["version"] == "692ab8548f0e"
+
+
+def test_version_is_a_dash_outside_an_openshift_build(caplog, build_commit):
+    build_commit(None)
+    c = MetricsCollector(conversation_id="conv-q13", runtime="sdk")
+
+    assert _fields(_usage_line(caplog, c))["version"] == "-"
+    assert "version" not in c.to_params()
+
+
+def test_build_commit_is_logged_in_full_once(caplog, build_commit):
+    build_commit(_STAGING_COMMIT)
+
+    with caplog.at_level(logging.INFO, logger="src.metrics.collector"):
+        MetricsCollector(conversation_id="a").log_summary()
+        MetricsCollector(conversation_id="b").log_summary()
+
+    announced = [r.getMessage() for r in caplog.records if "build commit" in r.getMessage()]
+    assert announced == [f"Parsec build commit: {_STAGING_COMMIT}"]
+
+
 # --------------------------------------------------- whole-turn behaviour
 
 
