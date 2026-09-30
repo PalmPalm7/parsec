@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 import httpx
 
 from src.config import get_config
+from src.connections import turn_state
 
 logger = logging.getLogger(__name__)
 
@@ -110,13 +111,86 @@ async def _get_client(cluster_name: str) -> httpx.AsyncClient:
     return client
 
 
+#: The reason recorded in :mod:`turn_state` for a controller that answered 401.
+#: Any other recorded reason is the text of a failed connection.
+_CREDENTIALS_REJECTED = "credentials rejected (HTTP 401)"
+
+
+def _target(cluster_name: str) -> str:
+    return f"aap2:{cluster_name}"
+
+
+def _unavailable_error(cluster_name: str) -> Exception | None:
+    """The error to raise, without a request, for a controller already dead this turn.
+
+    Once a controller has rejected Parsec's credentials or could not be
+    connected to, every retry fails the same way until an operator acts. On
+    the staging pod one question collected 47 AAP2 401s this way. The
+    exception type is the one the first failure raised: PermissionError keeps
+    the debug routes' 502 mapping, ConnectError keeps query_aap2's
+    "Cannot reach" handling.
+    """
+    reason = turn_state.dead_reason(_target(cluster_name))
+    if reason is None:
+        return None
+    if reason == _CREDENTIALS_REJECTED:
+        return PermissionError(
+            f"AAP2 controller '{cluster_name}' rejected Parsec's stored credentials (HTTP 401) "
+            "earlier in this investigation, so Parsec did not call it again. Retrying will not "
+            "help; an operator has to update the credentials. Report anything that depends on "
+            "this controller as unverified."
+        )
+    return httpx.ConnectError(
+        f"'{cluster_name}' was already unreachable earlier in this investigation ({reason}): "
+        "its host does not resolve or refuses connections, so Parsec did not call it again. "
+        "Retrying will not help; it needs an operator. Report anything that depends on this "
+        "controller as unverified."
+    )
+
+
+def unavailable_reason(cluster_name: str) -> str | None:
+    """Why ``cluster_name`` is not called again in this turn, or ``None``."""
+    error = _unavailable_error(cluster_name)
+    return str(error) if error else None
+
+
 def _check_response(resp: httpx.Response, cluster_name: str, path: str) -> None:
     """Raise clear errors for common HTTP failure codes."""
     if resp.status_code == 401:
-        raise PermissionError(f"Authentication failed for controller '{cluster_name}' (HTTP 401)")
+        # The old "Authentication failed for controller 'X'" led the model to
+        # tell users the controller was not configured and to offer to add
+        # credentials for it. It is configured; its credentials went stale.
+        turn_state.mark_dead(_target(cluster_name), _CREDENTIALS_REJECTED)
+        raise PermissionError(
+            f"Parsec's configured credentials for AAP2 controller '{cluster_name}' were "
+            "rejected (HTTP 401) — likely expired or rotated. The controller is configured; "
+            "retrying will not help, and an operator has to update the credentials."
+        )
     if resp.status_code == 404:
         raise LookupError(f"Not found on controller '{cluster_name}': {path} (HTTP 404)")
     resp.raise_for_status()
+
+
+async def _get(
+    cluster_name: str,
+    path: str,
+    params: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    """GET from a controller unless it already proved unusable in this turn."""
+    error = _unavailable_error(cluster_name)
+    if error is not None:
+        raise error
+    client = await _get_client(cluster_name)
+    try:
+        resp = await client.get(path, params=params or {}, headers=headers)
+    except httpx.ConnectError as e:
+        # DNS failures and refused connections: on staging the east and west
+        # controllers no longer resolve at all.
+        turn_state.mark_dead(_target(cluster_name), str(e) or type(e).__name__)
+        raise
+    _check_response(resp, cluster_name, path)
+    return resp
 
 
 async def api_get(cluster_name: str, path: str, params: dict | None = None) -> dict:
@@ -124,9 +198,7 @@ async def api_get(cluster_name: str, path: str, params: dict | None = None) -> d
 
     Returns the JSON response body. Raises on HTTP errors with clear messages.
     """
-    client = await _get_client(cluster_name)
-    resp = await client.get(path, params=params or {})
-    _check_response(resp, cluster_name, path)
+    resp = await _get(cluster_name, path, params)
     return resp.json()
 
 
@@ -135,9 +207,7 @@ async def api_get_text(cluster_name: str, path: str, params: dict | None = None)
 
     Overrides the default Accept header to request text/plain.
     """
-    client = await _get_client(cluster_name)
-    resp = await client.get(path, params=params or {}, headers={"Accept": "text/plain"})
-    _check_response(resp, cluster_name, path)
+    resp = await _get(cluster_name, path, params, headers={"Accept": "text/plain"})
     return resp.text
 
 

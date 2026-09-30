@@ -15,6 +15,7 @@ from src.connections.aap2 import (
     api_paginate,
     get_configured_controllers,
     resolve_controller,
+    unavailable_reason,
 )
 from src.tools.babylon import _SECRET_KEYS, _SECRET_PATTERNS
 
@@ -337,56 +338,83 @@ async def _find_jobs(
     max_results: int = 50,
 ) -> dict:
     """Search for jobs across one or all controllers."""
-    jobs: list[dict] = []
-    if controller:
-        cluster_name = resolve_controller(controller)
-        jobs = await _find_jobs_on_controller(
-            cluster_name,
-            status,
-            created_after,
-            created_before,
-            template_name,
-            max_results,
+    if not controller:
+        return await _find_jobs_on_all_controllers(
+            status, created_after, created_before, template_name, max_results
         )
-    else:
-        # Query all controllers in parallel
-        controllers = get_configured_controllers()
-        if not controllers:
-            return {"error": "No AAP2 controllers configured"}
-
-        per_controller = max(max_results // len(controllers), 10)
-        tasks = [
-            _find_jobs_on_controller(
-                name,
-                status,
-                created_after,
-                created_before,
-                template_name,
-                per_controller,
-            )
-            for name in controllers
-        ]
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        errors = []
-        for name, result in zip(controllers, results, strict=True):
-            if isinstance(result, BaseException):
-                errors.append(f"{name}: {result}")
-                logger.warning("AAP2 find_jobs failed on %s: %s", name, result)
-            else:
-                jobs.extend(result)
-
-        # Sort merged results by finished time (descending)
-        jobs.sort(key=lambda j: j.get("finished", "") or "", reverse=True)
-        jobs = jobs[:max_results]
-
-        if errors and not jobs:
-            return {"error": f"All controllers failed: {'; '.join(errors)}"}
-
+    cluster_name = resolve_controller(controller)
+    jobs = await _find_jobs_on_controller(
+        cluster_name,
+        status,
+        created_after,
+        created_before,
+        template_name,
+        max_results,
+    )
     return {
         "total": len(jobs),
         "jobs": jobs,
     }
+
+
+async def _find_jobs_on_all_controllers(
+    status: str,
+    created_after: str,
+    created_before: str,
+    template_name: str,
+    max_results: int,
+) -> dict:
+    """Query every configured controller in parallel and merge the newest jobs."""
+    controllers = get_configured_controllers()
+    if not controllers:
+        return {"error": "No AAP2 controllers configured"}
+
+    # A controller that already rejected Parsec's credentials or could not be
+    # reached in this turn is reported, not asked again.
+    unavailable = {name: why for name in controllers if (why := unavailable_reason(name))}
+    live = [name for name in controllers if name not in unavailable]
+    if not live:
+        return {
+            "error": "Every AAP2 controller failed earlier in this investigation; "
+            "none was called again.",
+            "unavailable": unavailable,
+        }
+
+    per_controller = max(max_results // len(live), 10)
+    tasks = [
+        _find_jobs_on_controller(
+            name,
+            status,
+            created_after,
+            created_before,
+            template_name,
+            per_controller,
+        )
+        for name in live
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    jobs: list[dict] = []
+    errors = []
+    for name, result in zip(live, results, strict=True):
+        if isinstance(result, BaseException):
+            errors.append(f"{name}: {result}")
+            logger.warning("AAP2 find_jobs failed on %s: %s", name, result)
+        else:
+            jobs.extend(result)
+
+    # Sort merged results by finished time (descending)
+    jobs.sort(key=lambda j: j.get("finished", "") or "", reverse=True)
+    jobs = jobs[:max_results]
+
+    extra: dict[str, Any] = {"unavailable": unavailable} if unavailable else {}
+    if errors and not jobs:
+        return {"error": f"All controllers failed: {'; '.join(errors)}", **extra}
+    if errors:
+        # Otherwise a controller that failed is silently missing from the
+        # jobs, and "no such job" reads the same as "could not look".
+        extra["errors"] = errors
+    return {"total": len(jobs), "jobs": jobs, **extra}
 
 
 def _validate_job_action(action: str, controller: str, job_id: int | None) -> dict | str:

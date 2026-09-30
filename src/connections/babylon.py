@@ -12,6 +12,7 @@ import httpx
 import yaml
 
 from src.config import get_config
+from src.connections import turn_state
 
 logger = logging.getLogger(__name__)
 
@@ -247,19 +248,79 @@ def resolve_cluster_from_comment(comment: str) -> str:
     return ""
 
 
+#: The reason recorded in :mod:`turn_state` for a cluster that answered 401.
+#: Any other recorded reason is the text of a failed connection.
+_CREDENTIALS_REJECTED = "credentials rejected (HTTP 401)"
+
+
+def _target(cluster_name: str) -> str:
+    return f"babylon:{cluster_name}"
+
+
+def _unavailable_error(cluster_name: str) -> Exception | None:
+    """The error to raise, without a request, for a cluster already dead this turn.
+
+    A rejected token or an API server that does not resolve fails the same way
+    on every retry. On the staging pod a babylon sub-agent went on calling
+    clusters after a GUID search had shown all six failing, and one question
+    collected 27 Babylon 401s.
+    """
+    reason = turn_state.dead_reason(_target(cluster_name))
+    if reason is None:
+        return None
+    if reason == _CREDENTIALS_REJECTED:
+        return PermissionError(
+            f"Babylon cluster '{cluster_name}' rejected Parsec's stored token (HTTP 401) earlier "
+            "in this investigation, so Parsec did not call it again. Retrying will not help; an "
+            "operator has to update its kubeconfig. Report anything that depends on this "
+            "cluster as unverified."
+        )
+    return httpx.ConnectError(
+        f"Babylon cluster '{cluster_name}' was already unreachable earlier in this "
+        f"investigation ({reason}): its API server does not resolve or refuses connections, so "
+        "Parsec did not call it again. Retrying will not help; it needs an operator. Report "
+        "anything that depends on this cluster as unverified."
+    )
+
+
+async def _get(cluster_name: str, path: str, params: dict | None = None) -> httpx.Response:
+    """GET from a cluster's API server unless it already proved unusable in this turn."""
+    error = _unavailable_error(cluster_name)
+    if error is not None:
+        raise error
+    client = await _get_client(cluster_name)
+    try:
+        resp = await client.get(path, params=params)
+    except httpx.ConnectError as e:
+        turn_state.mark_dead(_target(cluster_name), str(e) or type(e).__name__)
+        raise
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 401:
+            raise
+        # httpx's own text is a bare "Client error '401 Unauthorized' for url";
+        # say what it means and that another try will not change it.
+        turn_state.mark_dead(_target(cluster_name), _CREDENTIALS_REJECTED)
+        raise httpx.HTTPStatusError(
+            f"Parsec's configured token for Babylon cluster '{cluster_name}' was rejected "
+            "(HTTP 401) — likely expired or rotated. The cluster is configured; retrying will "
+            "not help, and an operator has to update its kubeconfig.",
+            request=e.request,
+            response=e.response,
+        ) from None
+    return resp
+
+
 async def k8s_get(cluster_name: str, path: str) -> dict:
     """Make a GET request to the Kubernetes API."""
-    client = await _get_client(cluster_name)
-    resp = await client.get(path)
-    resp.raise_for_status()
+    resp = await _get(cluster_name, path)
     return resp.json()
 
 
 async def k8s_get_text(cluster_name: str, path: str, params: dict | None = None) -> str:
     """Make a GET request to the Kubernetes API and return raw text (for pod logs)."""
-    client = await _get_client(cluster_name)
-    resp = await client.get(path, params=params or {})
-    resp.raise_for_status()
+    resp = await _get(cluster_name, path, params or {})
     return resp.text
 
 
@@ -284,9 +345,7 @@ async def k8s_list(
     if limit:
         params["limit"] = limit
 
-    client = await _get_client(cluster_name)
-    resp = await client.get(path, params=params)
-    resp.raise_for_status()
+    resp = await _get(cluster_name, path, params)
     return resp.json()
 
 
@@ -304,9 +363,7 @@ async def k8s_get_resource(
     else:
         path = f"/api/{version}/namespaces/{namespace}/{plural}/{name}"
 
-    client = await _get_client(cluster_name)
-    resp = await client.get(path)
-    resp.raise_for_status()
+    resp = await _get(cluster_name, path)
     return resp.json()
 
 
@@ -336,9 +393,7 @@ async def k8s_list_cluster_wide(
     if limit:
         params["limit"] = limit
 
-    client = await _get_client(cluster_name)
-    resp = await client.get(path, params=params)
-    resp.raise_for_status()
+    resp = await _get(cluster_name, path, params)
     return resp.json()
 
 
@@ -371,11 +426,9 @@ async def k8s_iter_cluster_wide(
     if label_selector:
         params["labelSelector"] = label_selector
 
-    client = await _get_client(cluster_name)
     seen = 0
     while True:
-        resp = await client.get(path, params=params)
-        resp.raise_for_status()
+        resp = await _get(cluster_name, path, params)
         page = resp.json()
         for item in page.get("items", []):
             yield item
