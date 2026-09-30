@@ -398,6 +398,7 @@ async def run_agent_via_sdk(
     from src.agent.sdk_stream import SdkEventTranslator
     from src.agent.streaming import sse_done, sse_error
     from src.config import get_config
+    from src.connections import turn_state
     from src.metrics.collector import MetricsCollector
 
     cfg = get_config()
@@ -445,6 +446,10 @@ async def run_agent_via_sdk(
     token = sse_sink.set(translator.push)
     stats = ToolStats()
     stats_token = tool_stats.set(stats)
+    # Connectors remember a target that failed for good (401/403, DNS) for the
+    # rest of this turn and no longer. Opened before the client starts, like the
+    # two above, so the bridge's handler tasks share it.
+    dead_token = turn_state.begin_turn()
     try:
         from claude_agent_sdk import ClaudeSDKClient
 
@@ -478,6 +483,7 @@ async def run_agent_via_sdk(
     finally:
         sse_sink.reset(token)
         tool_stats.reset(stats_token)
+        turn_state.end_turn(dead_token)
         _tool_cache.reset(cache_token)
 
     collector.tool_calls += stats.calls

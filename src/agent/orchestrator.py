@@ -1191,6 +1191,11 @@ async def run_agent(
             metadata={"mlflow.trace.session": session_id},
         )
 
+    # Per-turn like _tool_cache: connectors remember a target that failed for
+    # good (401/403, DNS) until this turn ends. Closed in the finally below.
+    from src.connections import turn_state
+
+    dead_token = turn_state.begin_turn()
     try:
         # Fast-path: skip orchestrator for obvious single-domain queries
         fast_agent = classify_fast(question)
@@ -1346,6 +1351,7 @@ async def run_agent(
             total_output_tokens=collector.output_tokens,
         )
         span_ctx.__exit__(*sys.exc_info())
+        turn_state.end_turn(dead_token)
 
 
 def _build_alert_user_message(
