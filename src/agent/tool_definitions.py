@@ -348,12 +348,14 @@ TOOLS = [
                 },
                 "drilldown_type": {
                     "type": "string",
-                    "enum": ["account_services", "instance_details"],
-                    "description": "For drilldown: type of drill-down.",
+                    # instance_details was listed too; the API answers it with 400
+                    # "Invalid drilldown_type".
+                    "enum": ["account_services"],
+                    "description": "For drilldown: type of drill-down (services of one account).",
                 },
                 "selected_key": {
                     "type": "string",
-                    "description": "For drilldown: the account ID or instance type to drill into.",
+                    "description": "For drilldown: the AWS account ID to drill into.",
                 },
             },
             "required": ["endpoint", "start_date", "end_date"],

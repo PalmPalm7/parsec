@@ -40,8 +40,9 @@ async def query_cost_monitor(
         providers: Comma-separated provider filter (e.g. "aws,azure").
         group_by: For breakdown: LINKED_ACCOUNT or INSTANCE_TYPE.
         top_n: For breakdown: number of top results (default 25).
-        drilldown_type: For drilldown: account_services or instance_details.
-        selected_key: For drilldown: the account ID or instance type to drill into.
+        drilldown_type: For drilldown: account_services (the API rejects
+            instance_details with 400 "Invalid drilldown_type").
+        selected_key: For drilldown: the AWS account ID to drill into.
 
     Returns:
         Dict with cost data from cost-monitor.
