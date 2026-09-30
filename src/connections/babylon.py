@@ -5,6 +5,7 @@ import os
 import ssl
 import tempfile
 from base64 import b64decode
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -316,13 +317,22 @@ async def k8s_list_cluster_wide(
     plural: str,
     label_selector: str = "",
     limit: int = 0,
+    field_selector: str = "",
 ) -> dict:
-    """List custom resources across all namespaces (cluster-wide)."""
+    """List custom resources across all namespaces (cluster-wide).
+
+    Unbounded on a production Babylon cluster this is thousands of objects in
+    one response. Prefer ``field_selector`` (``metadata.name=<name>`` works on
+    custom resources) for a lookup by name, and :func:`k8s_iter_cluster_wide`
+    when every object has to be examined.
+    """
     path = f"/apis/{group}/{version}/{plural}"
 
     params: dict[str, str | int] = {}
     if label_selector:
         params["labelSelector"] = label_selector
+    if field_selector:
+        params["fieldSelector"] = field_selector
     if limit:
         params["limit"] = limit
 
@@ -330,6 +340,52 @@ async def k8s_list_cluster_wide(
     resp = await client.get(path, params=params)
     resp.raise_for_status()
     return resp.json()
+
+
+#: Objects per page for :func:`k8s_iter_cluster_wide`. Small enough that one
+#: page parses quickly on the event loop; large enough to keep round trips low.
+LIST_PAGE_SIZE = 250
+
+
+async def k8s_iter_cluster_wide(
+    cluster_name: str,
+    group: str,
+    version: str,
+    plural: str,
+    label_selector: str = "",
+    page_size: int = 0,
+    max_items: int = 0,
+) -> AsyncIterator[dict]:
+    """Yield custom resources across all namespaces, one API page at a time.
+
+    Uses the API server's chunking (``limit`` + ``continue``) so a caller that
+    filters can stop as soon as it has enough, and memory holds one page rather
+    than the whole cluster. The unpaged list of every AnarchySubject on
+    babylon prod blocked the event loop long enough to fail three liveness
+    probes in a row, and the kubelet restarted the pod mid-investigation.
+    ``max_items`` bounds how many objects are examined in total (0 = all);
+    ``page_size`` 0 means :data:`LIST_PAGE_SIZE`.
+    """
+    path = f"/apis/{group}/{version}/{plural}"
+    params: dict[str, str | int] = {"limit": page_size or LIST_PAGE_SIZE}
+    if label_selector:
+        params["labelSelector"] = label_selector
+
+    client = await _get_client(cluster_name)
+    seen = 0
+    while True:
+        resp = await client.get(path, params=params)
+        resp.raise_for_status()
+        page = resp.json()
+        for item in page.get("items", []):
+            yield item
+            seen += 1
+            if max_items and seen >= max_items:
+                return
+        token = (page.get("metadata") or {}).get("continue")
+        if not token:
+            return
+        params["continue"] = token
 
 
 async def close_clients() -> None:

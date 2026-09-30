@@ -10,6 +10,7 @@ from src.connections.babylon import (
     k8s_get,
     k8s_get_resource,
     k8s_get_text,
+    k8s_iter_cluster_wide,
     k8s_list,
     k8s_list_cluster_wide,
     resolve_cluster_from_comment,
@@ -1026,48 +1027,49 @@ async def _list_anarchy_subjects(
             all_subjects.extend(result.get("items", []))
         except Exception as e:
             errors.append(f"{namespace}: {e}")
-    else:
-        # Cluster-wide listing — covers all anarchy namespaces automatically.
-        try:
-            result = await k8s_list_cluster_wide(
-                cluster,
-                ANARCHY_SUBJECT_GROUP,
-                ANARCHY_SUBJECT_VERSION,
-                ANARCHY_SUBJECT_PLURAL,
-            )
-            all_subjects.extend(result.get("items", []))
-        except Exception as e:
-            errors.append(f"cluster-wide: {e}")
 
-    # Apply filters
     search_lower = search.lower() if search else ""
     guid_str = guid or ""
-    filtered = []
+    filtered: list[dict] = []
 
-    for item in all_subjects:
+    def _keep(item: dict) -> bool:
         info = _extract_anarchy_subject_info(item)
-
         if (
             search_lower
             and search_lower not in info["name"].lower()
             and search_lower not in info.get("governor", "").lower()
         ):
-            continue
+            return False
         if guid_str:
             iv = info.get("instance_vars", {})
             if iv.get("guid", "") != guid_str and guid_str not in info["name"]:
-                continue
-
+                return False
         # When searching by GUID, include all states (including destroy-failed).
         # Otherwise, skip fully completed subjects to reduce noise.
-        if not guid_str:
-            state = info.get("current_state", "")
-            if state in ("destroyed",):
-                continue
-
+        if not guid_str and info.get("current_state", "") in ("destroyed",):
+            return False
         filtered.append(info)
-        if len(filtered) >= max_results:
-            break
+        return True
+
+    if namespace:
+        for item in all_subjects:
+            _keep(item)
+            if len(filtered) >= max_results:
+                break
+    else:
+        # Cluster-wide, one page at a time, stopping once enough have matched:
+        # the whole list on a production cluster is thousands of objects.
+        try:
+            async for item in k8s_iter_cluster_wide(
+                cluster,
+                ANARCHY_SUBJECT_GROUP,
+                ANARCHY_SUBJECT_VERSION,
+                ANARCHY_SUBJECT_PLURAL,
+            ):
+                if _keep(item) and len(filtered) >= max_results:
+                    break
+        except Exception as e:
+            errors.append(f"cluster-wide: {e}")
 
     return {
         "cluster": cluster,
@@ -1211,11 +1213,14 @@ async def _get_workshop(
     # If namespace is not provided, search cluster-wide
     if not namespace:
         try:
+            # Ask the API server for this name only; listing every Workshop
+            # to find one was the whole cluster in a single response.
             all_ws = await k8s_list_cluster_wide(
                 cluster,
                 WORKSHOP_GROUP,
                 WORKSHOP_VERSION,
                 WORKSHOP_PLURAL,
+                field_selector=f"metadata.name={name}",
             )
             for item in all_ws.get("items", []):
                 if item.get("metadata", {}).get("name") == name:
@@ -1327,14 +1332,16 @@ async def _list_anarchy_actions(
             errors.append(f"{namespace}: {e}")
     else:
         try:
-            result = await k8s_list_cluster_wide(
+            # Same 500-object bound as before, fetched in pages rather than one
+            # response so the event loop keeps answering health probes.
+            async for item in k8s_iter_cluster_wide(
                 cluster,
                 ANARCHY_ACTION_GROUP,
                 ANARCHY_ACTION_VERSION,
                 ANARCHY_ACTION_PLURAL,
-                limit=500,
-            )
-            all_actions.extend(result.get("items", []))
+                max_items=500,
+            ):
+                all_actions.append(item)
         except Exception as e:
             errors.append(f"cluster-wide: {e}")
 
@@ -1437,11 +1444,14 @@ async def _get_multiworkshop(
     # If namespace is not provided, search cluster-wide for the MultiWorkshop
     if not namespace:
         try:
+            # Ask the API server for this name only; listing every MultiWorkshop
+            # to find one was the whole cluster in a single response.
             all_mws = await k8s_list_cluster_wide(
                 cluster,
                 MULTI_WORKSHOP_GROUP,
                 MULTI_WORKSHOP_VERSION,
                 MULTI_WORKSHOP_PLURAL,
+                field_selector=f"metadata.name={name}",
             )
             for item in all_mws.get("items", []):
                 if item.get("metadata", {}).get("name") == name:
