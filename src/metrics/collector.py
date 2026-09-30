@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from src.connections.mlflow_tracking import get_experiment_name, get_mlflow_client
@@ -50,6 +51,10 @@ class MetricsCollector:
     # Which LLM runtime produced this turn ("legacy" | "sdk"). Logged as a run
     # tag + param so legacy and SDK populations can be pivoted in one experiment.
     runtime: str = "legacy"
+    # Sub-agents the SDK orchestrator delegated to, in order and with repeats
+    # ("cost,cost,cost" is a re-delegation). agent_type stays "orchestrator" on
+    # that path, so without this every SDK turn looked alike.
+    sub_agents: str = ""
 
     # Metrics
     _start_time: float = 0.0
@@ -128,6 +133,9 @@ class MetricsCollector:
     def record_runtime(self, runtime: str) -> None:
         self.runtime = runtime
 
+    def record_sub_agents(self, agent_types: Iterable[str]) -> None:
+        self.sub_agents = ",".join(agent_types)
+
     def record_cost(self, cost_usd: float) -> None:
         """Record an authoritative cost (the SDK reports ``total_cost_usd``).
 
@@ -169,6 +177,7 @@ class MetricsCollector:
                 "confidence": self.confidence,
                 "status": self.status,
                 "runtime": self.runtime,
+                "sub_agents": self.sub_agents,
             }.items()
             if v
         }
@@ -196,14 +205,22 @@ class MetricsCollector:
         were then collected and discarded, which made prompt-cache behaviour
         impossible to observe anywhere. This keeps them in the log regardless of
         whether the tracking server answers.
+
+        The conversation id and status lead the line: without them, costs from
+        the e2e run had to be paired with questions by log adjacency, and an
+        overlapping request made that ambiguous.
         """
         cached_in = self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
         hit_pct = (self.cache_read_tokens / cached_in * 100) if cached_in else 0.0
         logger.info(
-            "usage runtime=%s agent=%s in=%d out=%d cache_read=%d cache_write=%d "
+            "usage conversation_id=%s status=%s runtime=%s agent=%s sub_agents=%s "
+            "in=%d out=%d cache_read=%d cache_write=%d "
             "cache_hit=%.1f%% tools=%d errors=%d cost_usd=%.4f latency_ms=%.0f",
+            self.conversation_id or "-",
+            self.status or "-",
             self.runtime or "-",
             self.agent_type or "-",
+            self.sub_agents or "-",
             self.input_tokens,
             self.output_tokens,
             self.cache_read_tokens,

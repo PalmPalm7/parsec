@@ -47,9 +47,30 @@ _CLI_ERROR_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
     ),
 )
 
+#: Token fields as ``record_tokens`` takes them, and as ``ResultMessage`` spells
+#: them in ``model_usage`` (camelCase, one entry per model) and in ``usage``.
+_MODEL_USAGE_FIELDS = {
+    "input_tokens": "inputTokens",
+    "output_tokens": "outputTokens",
+    "cache_creation_tokens": "cacheCreationInputTokens",
+    "cache_read_tokens": "cacheReadInputTokens",
+}
+_USAGE_FIELDS = {
+    "input_tokens": "input_tokens",
+    "output_tokens": "output_tokens",
+    "cache_creation_tokens": "cache_creation_input_tokens",
+    "cache_read_tokens": "cache_read_input_tokens",
+}
+
 
 class SdkEventTranslator:
     """Stateful translator for one orchestrator turn."""
+
+    #: Every delegation this turn, in order and with repeats, for the usage line;
+    #: ``_active_agents`` forgets an agent as soon as it reports back.
+    _delegated: tuple[str, ...] = ()
+    #: Set once the turn's usage is recorded, so it is never recorded twice.
+    _metrics_recorded: bool = False
 
     def __init__(self, *, question: str, history: list) -> None:
         self._question = question
@@ -225,6 +246,7 @@ class SdkEventTranslator:
 
         if tool_use_id:
             self._active_agents[tool_use_id] = agent_type
+        self._delegated += (agent_type,)
         agent_cfg = AGENTS.get(agent_type)
         name = agent_cfg.name if agent_cfg else agent_type
         yield sse_agent_start(agent_type, name)
@@ -330,26 +352,31 @@ class SdkEventTranslator:
         yield sse_event("history", {"messages": history})
         yield sse_done()
 
-    def _record_metrics(self, collector: Any) -> None:
+    def record_aborted(self, collector: Any) -> None:
+        """Record the turn as aborted unless :meth:`finish` already recorded it.
+
+        A browser that goes away closes the response generator at a ``yield``
+        (``GeneratorExit``) or cancels it at an ``await`` (``CancelledError``),
+        so ``finish`` never runs and the turn left no usage line at all. The
+        orchestrator calls this from a ``finally``, so it must not yield.
+        """
+        self._record_metrics(collector, status="aborted")
+
+    def _record_metrics(self, collector: Any, *, status: str | None = None) -> None:
         """Record usage, then flush. Never let telemetry break the response."""
+        if self._metrics_recorded:
+            return
+        self._metrics_recorded = True
         try:
-            usage = getattr(self._usage, "usage", None) or {}
-            if isinstance(usage, dict):
-                collector.record_tokens(
-                    input_tokens=usage.get("input_tokens", 0) or 0,
-                    output_tokens=usage.get("output_tokens", 0) or 0,
-                    cache_creation_tokens=usage.get("cache_creation_input_tokens", 0) or 0,
-                    cache_read_tokens=usage.get("cache_read_input_tokens", 0) or 0,
-                )
+            collector.record_tokens(**_turn_tokens(self._usage))
             cost = getattr(self._usage, "total_cost_usd", None)
             if cost:
                 collector.record_cost(cost)
-            model = getattr(self._usage, "model", None)
-            if model and not getattr(collector, "model", None):
-                collector.record_model(model)
             # The legacy loop sets a turn status; the SDK path left it blank, so
             # failed SDK turns were indistinguishable from successful ones in MLflow.
-            collector.status = "error" if self._failure_reason() else "success"
+            collector.status = status or ("error" if self._failure_reason() else "success")
+            if self._delegated:
+                collector.record_sub_agents(self._delegated)
         except Exception:
             logger.exception("Failed to record SDK orchestrator metrics")
 
@@ -367,6 +394,25 @@ class SdkEventTranslator:
     @property
     def session_id(self) -> str | None:
         return self._session_id
+
+
+def _turn_tokens(result: Any) -> dict[str, int]:
+    """Token counts for the whole turn, sub-agents included.
+
+    ``usage`` counts only the orchestrator's own API calls; ``model_usage`` has
+    every call the CLI made, sub-agents included, per model. From ``usage``
+    staging q13 logged in=10 out=9586, about $0.34 at list price, for a turn the
+    SDK itself costed at $3.93. ``usage`` is the fallback for a CLI without it.
+    """
+    per_model = getattr(result, "model_usage", None)
+    if isinstance(per_model, dict) and per_model:
+        entries = [e for e in per_model.values() if isinstance(e, dict)]
+        fields = _MODEL_USAGE_FIELDS
+    else:
+        usage = getattr(result, "usage", None)
+        entries = [usage] if isinstance(usage, dict) else []
+        fields = _USAGE_FIELDS
+    return {ours: sum(int(e.get(theirs) or 0) for e in entries) for ours, theirs in fields.items()}
 
 
 def _flatten_content(content: Any) -> str:

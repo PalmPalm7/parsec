@@ -419,6 +419,12 @@ async def run_agent_via_sdk(
         yield sse_done()
         return
 
+    # ResultMessage carries no model name, so the options are the only record of
+    # which model ran the turn; MLflow's model param was blank for every SDK turn.
+    model = getattr(options, "model", None)
+    if model:
+        collector.record_model(str(model))
+
     prompt = translator.build_prompt()
 
     # The bridge pushes tool events onto the same queue the translator drains,
@@ -451,42 +457,50 @@ async def run_agent_via_sdk(
     # two above, so the bridge's handler tasks share it.
     dead_token = turn_state.begin_turn()
     try:
-        from claude_agent_sdk import ClaudeSDKClient
+        try:
+            from claude_agent_sdk import ClaudeSDKClient
 
-        # The ceiling is applied to each await, not with `asyncio.timeout()`
-        # around the loop: this is an async generator, and a cancellation that
-        # lands while it is suspended at a `yield` would be raised inside the
-        # response writer instead, killing the stream with no error event.
-        async with ClaudeSDKClient(options) as client:
-            await asyncio.wait_for(client.query(prompt), _remaining())
-            messages = client.receive_response().__aiter__()
-            while True:
-                try:
-                    message = await asyncio.wait_for(anext(messages), _remaining())
-                except StopAsyncIteration:
-                    break
-                for event in translator.translate(message):
-                    yield event
-                # Drain anything the bridge queued while that message was handled.
-                for event in translator.drain():
-                    yield event
-    except TimeoutError:
-        # Leaving the `async with` above has already stopped the CLI subprocess.
-        logger.warning("SDK orchestrator turn exceeded agent.sdk.turn_timeout=%ss", turn_timeout)
-        translator.fail(
-            f"the investigation was stopped after {int(turn_timeout or 0)}s "
-            "(agent.sdk.turn_timeout) — narrow the question or raise the limit"
-        )
-    except Exception as e:
-        logger.exception("SDK orchestrator failed")
-        yield sse_error(str(e))
+            # The ceiling is applied to each await, not with `asyncio.timeout()`
+            # around the loop: this is an async generator, and a cancellation that
+            # lands while it is suspended at a `yield` would be raised inside the
+            # response writer instead, killing the stream with no error event.
+            async with ClaudeSDKClient(options) as client:
+                await asyncio.wait_for(client.query(prompt), _remaining())
+                messages = client.receive_response().__aiter__()
+                while True:
+                    try:
+                        message = await asyncio.wait_for(anext(messages), _remaining())
+                    except StopAsyncIteration:
+                        break
+                    for event in translator.translate(message):
+                        yield event
+                    # Drain anything the bridge queued while that message was handled.
+                    for event in translator.drain():
+                        yield event
+        except TimeoutError:
+            # Leaving the `async with` above has already stopped the CLI subprocess.
+            logger.warning(
+                "SDK orchestrator turn exceeded agent.sdk.turn_timeout=%ss", turn_timeout
+            )
+            translator.fail(
+                f"the investigation was stopped after {int(turn_timeout or 0)}s "
+                "(agent.sdk.turn_timeout) — narrow the question or raise the limit"
+            )
+        except Exception as e:
+            logger.exception("SDK orchestrator failed")
+            yield sse_error(str(e))
+        finally:
+            collector.tool_calls += stats.calls
+            collector.tool_errors += stats.errors
+            sse_sink.reset(token)
+            tool_stats.reset(stats_token)
+            turn_state.end_turn(dead_token)
+            _tool_cache.reset(cache_token)
+
+        for event in translator.finish(collector):
+            yield event
     finally:
-        sse_sink.reset(token)
-        tool_stats.reset(stats_token)
-        turn_state.end_turn(dead_token)
-        _tool_cache.reset(cache_token)
-
-    collector.tool_calls += stats.calls
-    collector.tool_errors += stats.errors
-    for event in translator.finish(collector):
-        yield event
+        # A client that disconnects stops this generator at a `yield` or an
+        # `await`, so finish() never runs. Record the turn as aborted instead of
+        # losing it; after finish() this is a no-op. No `yield` in here.
+        translator.record_aborted(collector)
