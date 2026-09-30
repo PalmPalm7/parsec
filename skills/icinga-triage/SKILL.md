@@ -89,8 +89,9 @@ Then find the alert with `query_icinga`: if host+service given, `get_services` w
 + a `filter_expr` using `match()` on `service.display_name`/`service.name`. If only a host,
 list its services with `get_services`. If only a service name,
 `match("*keyword*", service.display_name)` across hosts. If ambiguous, `get_problems` with
-`host` and/or `service`. Dashboard service names (e.g. "Babylon Schema YAML Diff") differ
-from internal names — bridge with `match()` wildcards.
+the Icinga `host` and/or `service` name (e.g. `odf_osd_util`); it has no display names.
+Dashboard service names (e.g. "Babylon Schema YAML Diff") differ from internal names —
+bridge with `match()` wildcards.
 Once found, extract `attrs.state`, `attrs.last_check_result.{output,command,exit_status}`,
 `attrs.acknowledgement`, `attrs.downtime_depth`, `attrs.host_name`, `attrs.name`. Also
 check `get_comments` and `get_downtimes` — if already in downtime, report that first.

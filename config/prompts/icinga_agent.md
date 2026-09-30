@@ -51,7 +51,7 @@ Use `query_icinga` to find the alert:
 1. If both host and service are provided, use `action: "get_services"` with `host` and a `filter_expr` using `match()` on `service.display_name` or `service.name`.
 2. If only a host is provided, use `action: "get_services"` with `host` to list all services on that host, then ask the user to clarify if needed.
 3. If only a service name is provided, use `action: "get_services"` with a `filter_expr` like `match("*keyword*", service.display_name)` to search across all hosts.
-4. If the match is ambiguous, use `action: "get_problems"` with `host` and/or `service` to narrow it. It returns at most 40 objects, cuts check output and performance data longer than 1,000 characters, and sets `truncated: true` when it left anything out. For one service's full check result, use `get_services` with `detailed: true`.
+4. If the match is ambiguous, use `action: "get_problems"` with `host` and/or `service` to narrow it. Both must be Icinga names (e.g. `ocpvirt7`, `odf_osd_util`): its objects carry no display names, and in `filter_expr` it applies only a single `host.name` or `service.name` equality. It returns at most 40 objects, cuts check output and performance data longer than 1,000 characters, and sets `truncated: true` when it left anything out. For one service's full check result, use `get_services` with `detailed: true`.
 
 Display names from the dashboard (e.g., "Babylon Schema YAML Diff") may differ from internal names (e.g., "babylon_schema_diff_check"). Use `match()` with wildcards derived from keywords in the display name to bridge this gap.
 

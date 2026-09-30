@@ -3,7 +3,10 @@
 Payloads mirror what the live monitoring-mcp sidecar returned in the 2026-09-30
 OpenShift end-to-end run: ``get_problems`` answers ``{"hosts": [...],
 "services": [...]}`` for all of Icinga whatever the caller asked, and every
-timestamp is a raw epoch float.
+timestamp is a raw epoch float. Its service objects carry only
+acknowledgement, downtime_depth, host_name, last_check_result, name and state,
+with no display_name. The captured hosts list was empty, so the Host objects
+here are modelled on the same attributes.
 """
 
 from __future__ import annotations
@@ -50,9 +53,9 @@ def _service(
     }
 
 
-def _host(name: str, display_name: str) -> dict:
+def _host(name: str) -> dict:
     return {
-        "attrs": {"name": name, "display_name": display_name, "state": 1},
+        "attrs": {"acknowledgement": 0, "downtime_depth": 0, "name": name, "state": 1},
         "joins": {},
         "meta": {},
         "name": name,
@@ -64,7 +67,7 @@ def _problems_payload() -> dict:
     return {
         "result": json.dumps(
             {
-                "hosts": [_host("ocpvirt7", "ocpv07 IBM Cloud"), _host("infra02", "infra02")],
+                "hosts": [_host("ocpvirt7"), _host("infra02")],
                 "services": [
                     _service("ocpvirt6", "ocpv-pvc-usage"),
                     _service("ocpvirt7", "ocp-virt-status"),
@@ -122,13 +125,6 @@ async def test_get_problems_keeps_only_the_requested_host():
 
 
 @pytest.mark.asyncio
-async def test_get_problems_host_matches_a_host_objects_display_name():
-    _, body = await _problems(host="OCPV07 IBM Cloud")
-
-    assert _names(body) == ["ocpvirt7"]
-
-
-@pytest.mark.asyncio
 async def test_get_problems_applies_a_host_equality_filter_expr():
     # The exact call the model made in dev q08 L75.
     out, body = await _problems(filter_expr='host.name == "ocpvirt7"')
@@ -142,6 +138,43 @@ async def test_get_problems_filters_by_service_and_drops_host_objects():
     _, body = await _problems(service="ocp-virt-status")
 
     assert _names(body) == ["ocpvirt7!ocp-virt-status", "ocpvirt8!ocp-virt-status"]
+
+
+@pytest.mark.asyncio
+async def test_get_problems_miss_on_a_service_display_name_points_at_get_services():
+    # The prompt sends the model here with a dashboard service name; live
+    # service objects carry no display_name, so only odf_osd_util can match.
+    out, body = await _problems(service="[ODF] OSD Util")
+
+    assert _names(body) == []
+    assert "get_services" in out["hint"]
+    assert 'match("*[ODF] OSD Util*", service.display_name)' in out["hint"]
+
+
+@pytest.mark.asyncio
+async def test_get_problems_says_when_filter_expr_disagrees_with_host():
+    out, body = await _problems(host="ocpvirt7", filter_expr='host.name == "ocpvirt8"')
+
+    assert _names(body) == ["ocpvirt7", "ocpvirt7!ocp-virt-status", "ocpvirt7!odf_osd_util"]
+    assert "'ocpvirt8'" in out["note"]
+    assert "host argument was used" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_get_problems_says_when_filter_expr_disagrees_with_service():
+    out, body = await _problems(service="odf_osd_util", filter_expr="service.name == 'other'")
+
+    assert _names(body) == ["ocpvirt7!odf_osd_util"]
+    assert "service argument was used" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_get_problems_ignores_a_display_name_filter_expr():
+    # Applied as a name filter it matched nothing on the live payload.
+    out, body = await _problems(filter_expr='service.display_name == "[ODF] OSD Util"')
+
+    assert len(_names(body)) == 7
+    assert "ignored" in out["note"]
 
 
 @pytest.mark.asyncio

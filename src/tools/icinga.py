@@ -68,10 +68,9 @@ _EPOCH_FIELDS: frozenset[str] = frozenset(
 #: e.g. ``host.name == "ocpvirt7"``. The value stops at its closing quote, so a
 #: compound such as ``host.name == "a" && service.name == "b"`` does not match
 #: and is reported as ignored, instead of being read as one host literally
-#: named ``a" && service.name == "b`` that matches nothing.
-_NAME_EQUALITY = re.compile(
-    r"""^\s*(host|service)\.(?:name|display_name)\s*==\s*(["'])((?:(?!\2).)*)\2\s*$"""
-)
+#: named ``a" && service.name == "b`` that matches nothing. display_name is not
+#: accepted: the objects get_problems returns carry no display names.
+_NAME_EQUALITY = re.compile(r"""^\s*(host|service)\.name\s*==\s*(["'])((?:(?!\2).)*)\2\s*$""")
 
 
 def _build_read_args(
@@ -268,10 +267,11 @@ def _equals_any(wanted: str, names: list[Any]) -> bool:
 def _problem_matches(obj: Any, host: str, service: str) -> bool:
     """Whether one Host or Service object from get_problems matches the filters.
 
-    A host matches on its name or display name. A service matches on its own
-    name or display name, and on its host's name (``host_name``, or the part of
-    ``host!service`` before the "!"); services do not carry the host's display
-    name, so that one cannot be matched here.
+    Only Icinga object names match, ignoring case: a host on its name, a
+    service on its own name and on its host's (``host_name``, or the part of
+    ``host!service`` before the "!"). The objects monitoring-mcp returns carry
+    no display names, so a dashboard name such as "ocpv07" or "[ODF] OSD Util"
+    never matches here; _miss_hint tells the caller how to resolve it.
     """
     if not isinstance(obj, dict):
         return False
@@ -281,15 +281,37 @@ def _problem_matches(obj: Any, host: str, service: str) -> bool:
     if host:
         names = [attrs.get("host_name"), host_part]
         if not is_service:
-            names += [attrs.get("name"), attrs.get("display_name")]
+            names.append(attrs.get("name"))
         if not _equals_any(host, names):
             return False
     if service:
         if not is_service:
             return False
-        if not _equals_any(service, [attrs.get("name"), attrs.get("display_name"), service_part]):
+        if not _equals_any(service, [attrs.get("name"), service_part]):
             return False
     return True
+
+
+def _miss_hint(host: str, service: str) -> str:
+    """Say how to resolve a display name after get_problems matched nothing.
+
+    An empty result is also what a healthy host or service gives, so the hint
+    is framed as "if" and says how to find out which it was.
+    """
+    advice = ["No current problem matched these filters."]
+    if host:
+        advice.append(
+            f"If {host!r} is a dashboard display name, look up the Icinga host name with "
+            f"get_hosts search={host!r} and filter on that."
+        )
+    if service:
+        scope = f" and host={host!r}" if host else ""
+        advice.append(
+            f"get_problems matches Icinga service names such as odf_osd_util. If {service!r} "
+            "is a display name, find the service with get_services filter_expr="
+            f"'match(\"*{service}*\", service.display_name)'{scope}."
+        )
+    return " ".join(advice)
 
 
 def _trimmed(value: Any) -> tuple[Any, bool]:
@@ -370,10 +392,11 @@ def _filter_problems(
     """Apply the caller's filters to a get_problems result and bound what is sent.
 
     ``filter_expr`` is honoured only as a single host or service name equality;
-    anything else is reported back as ignored rather than silently dropped.
-    The result is bounded by size as well as count: long check output is
-    trimmed and objects past _PROBLEMS_BUDGET are counted, not sent, with
-    ``truncated: true`` whenever anything was left out.
+    anything else is reported back as ignored rather than silently dropped, and
+    so is an equality that disagrees with the ``host`` or ``service`` argument,
+    which wins. The result is bounded by size as well as count: long check
+    output is trimmed and objects past _PROBLEMS_BUDGET are counted, not sent,
+    with ``truncated: true`` whenever anything was left out.
     """
     data = _decoded(raw)
     if data is None:
@@ -384,13 +407,20 @@ def _filter_problems(
         equality = _NAME_EQUALITY.match(filter_expr)
         if equality is None:
             notes.append(
-                "get_problems cannot evaluate filter_expr, so it was ignored; use "
-                "get_services or get_hosts for filter expressions."
+                "get_problems applies only a single host.name or service.name equality, so "
+                "this filter_expr was ignored; use get_services or get_hosts for other filter "
+                "expressions."
             )
-        elif equality.group(1) == "host":
-            host = host or equality.group(3)
         else:
-            service = service or equality.group(3)
+            field, value = equality.group(1), equality.group(3)
+            given = host if field == "host" else service
+            if not given:
+                host, service = (value, service) if field == "host" else (host, value)
+            elif given.casefold() != value.casefold():
+                notes.append(
+                    f"filter_expr names {field} {value!r} but {field}={given!r} was also "
+                    f"given; the {field} argument was used."
+                )
 
     # The server returns {"hosts": [...], "services": [...]}; a bare list is
     # handled the same way as a single section.
@@ -428,12 +458,8 @@ def _filter_problems(
             "trimmed; get_services with host, filter_expr 'service.name == \"<name>\"' "
             "and detailed=true returns one service's full check result."
         )
-    if host and not hits:
-        out["hint"] = (
-            f"No current problem matched these filters. If {host!r} is a dashboard display "
-            f"name, look up the Icinga host name with get_hosts search={host!r} and filter "
-            "on that."
-        )
+    if (host or service) and not hits:
+        out["hint"] = _miss_hint(host, service)
     if notes:
         out["note"] = " ".join(notes)
     return out
