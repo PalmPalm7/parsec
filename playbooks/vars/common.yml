@@ -85,6 +85,16 @@ sdk_max_turns: 30             # orchestrator session
 sdk_subagent_min_turns: 20    # floor for each sub-agent's cap
 sdk_turn_timeout: 900         # whole turn, sub-agents included (seconds); 0 disables
 
+# Opt-in NetworkPolicy (parsec-api-ingress) for the app port: only the
+# oauth-proxy pod, the OpenShift router (parsec-health route) and host-network
+# traffic (kubelet probes) may reach 8000. The app takes the caller's identity
+# from X-Forwarded-Email, which only the oauth-proxy sets after a login; with no
+# policy, any pod in the cluster can send that header to parsec-service
+# directly and act as any user. Off until verified on a cluster. Setting it
+# back to false does not remove the object:
+#   oc -n <namespace> delete networkpolicy parsec-api-ingress
+network_policy_enabled: false
+
 # Pod sizing for the parsec container under the SDK runtime. Every turn spawns a
 # `claude` CLI (Node) subprocess next to the app, so the legacy template
 # defaults (512Mi / 500m) are too small. Measured on parsec-dev (2026-09-30):

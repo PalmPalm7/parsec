@@ -88,3 +88,57 @@ class TestSdkTurnBudgets:
         assert sdk["orchestrator"] is True
         assert sdk["allow_writes"] is False
         assert sdk["timeout"] == 300
+
+
+def _by_kind(docs: list[dict], kind: str) -> list[dict]:
+    return [d for d in docs if d["kind"] == kind]
+
+
+def _deployment(docs: list[dict], name: str) -> dict:
+    (dep,) = [d for d in _by_kind(docs, "Deployment") if d["metadata"]["name"] == name]
+    return dep
+
+
+class TestNetworkPolicy:
+    """Found on both deployments: no NetworkPolicy, and every Service targets port 8000.
+
+    The app trusts X-Forwarded-Email, which only the oauth-proxy sets after a
+    login, so any in-cluster caller could reach parsec-service and claim to be
+    any user (report F14). The policy is opt-in until verified on a cluster.
+    """
+
+    def test_off_by_default(self):
+        assert _by_kind(render(), "NetworkPolicy") == []
+        assert _by_kind(render(network_policy_enabled=None), "NetworkPolicy") == []
+
+    @pytest.mark.parametrize("flag", [True, "true", "yes"])
+    def test_enabled_renders_one_policy(self, flag):
+        assert len(_by_kind(render(network_policy_enabled=flag), "NetworkPolicy")) == 1
+
+    def test_policy_admits_only_proxy_router_and_host_network_on_the_app_port(self):
+        docs = render(network_policy_enabled=True)
+        (policy,) = _by_kind(docs, "NetworkPolicy")
+        spec = policy["spec"]
+        app = _deployment(docs, "parsec")["spec"]["template"]
+        proxy = _deployment(docs, "oauth-proxy")["spec"]["template"]
+        (container,) = [c for c in app["spec"]["containers"] if c["name"] == "parsec"]
+
+        # Selects the app pod, and only its ingress is restricted.
+        assert spec["podSelector"]["matchLabels"].items() <= app["metadata"]["labels"].items()
+        assert spec["policyTypes"] == ["Ingress"]
+
+        (rule,) = spec["ingress"]
+        assert rule["ports"] == [
+            {"protocol": "TCP", "port": container["ports"][0]["containerPort"]}
+        ]
+        pod_peers = [p["podSelector"]["matchLabels"] for p in rule["from"] if "podSelector" in p]
+        ns_peers = [
+            p["namespaceSelector"]["matchLabels"] for p in rule["from"] if "namespaceSelector" in p
+        ]
+        assert len(pod_peers) + len(ns_peers) == len(rule["from"]) == 3
+        # The one pod peer is the oauth-proxy's pod template, not the app itself.
+        assert pod_peers == [proxy["metadata"]["labels"]]
+        assert ns_peers == [
+            {"policy-group.network.openshift.io/ingress": ""},
+            {"policy-group.network.openshift.io/host-network": ""},
+        ]
