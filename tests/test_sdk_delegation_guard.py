@@ -81,6 +81,22 @@ async def test_the_orchestrators_own_tools_are_allowed(_sdk_stub, tool):
     assert await _decide(_guard(), _pre(f"mcp__parsec__{tool}")) == (None, "")
 
 
+@pytest.mark.parametrize("tool", ["fetch_github_file", "search_github_repo"])
+async def test_generic_github_reads_are_allowed_on_the_main_thread(_sdk_stub, tool):
+    """q12, "summarize rhpds/parsec README": one fetch_github_file, rated good.
+
+    Refusing it would cost a refusal turn plus a specialist spawn to read a README.
+    """
+    assert await _decide(_guard(), _pre(f"mcp__parsec__{tool}")) == (None, "")
+
+
+async def test_other_github_adjacent_specialist_tools_are_still_refused(_sdk_stub):
+    decision, reason = await _decide(_guard(), _pre("mcp__parsec__lookup_catalog_item"))
+
+    assert decision == "deny"
+    assert "subagent_type=" in reason
+
+
 @pytest.mark.parametrize(
     "tool, agent_type",
     [

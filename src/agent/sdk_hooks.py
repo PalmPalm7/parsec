@@ -35,7 +35,7 @@ driving the pinned CLI 2.1.169 (and the wheel's bundled 2.1.185):
   CLI keeps flushing while it waits for a hook's answer.
 
 The second hook here uses that: the orchestrator's main thread may call only
-its own direct tools. Every bridged tool is approved session-wide so that
+its own direct tools and the generic GitHub reads. Every bridged tool is approved session-wide so that
 sub-agents can use theirs, and on the live pods the orchestrator used that
 approval to skip delegation — dev q03 ran ``query_gcp_projects`` itself, so
 the cost agent and its spend workflow never loaded; dev q06 ran
@@ -76,6 +76,14 @@ _FLUSH_WAIT_S = 0.5
 _FLUSH_POLL_S = 0.02
 
 _POST_TOOL_EVENTS: tuple[HookEvent, ...] = ("PostToolUse", "PostToolUseFailure")
+
+#: Specialist tools the orchestrator may still call on its own thread: generic,
+#: read-only GitHub reads that belong to no one domain. q12 ("summarize the
+#: rhpds/parsec README") was answered well on dev and staging with one
+#: fetch_github_file call from the main thread. Refusing it costs an
+#: orchestrator turn for the refusal, then a specialist with its domain prompt
+#: and preloaded skills, just to read a README.
+MAIN_THREAD_READ_TOOLS = frozenset({"fetch_github_file", "search_github_repo"})
 
 
 def _subagent_transcript(input_data: Any) -> Path | None:
@@ -250,7 +258,8 @@ def delegation_guard_hook(
     itself; ``tool_owners`` maps every other bridged name to the sub-agents that
     have it, so the refusal can say where to delegate. The Reporting-MCP
     ``db_*`` tools are always the orchestrator's own, including any discovered
-    after ``direct_tools`` was computed. Inside a sub-agent nothing is refused:
+    after ``direct_tools`` was computed, and so are ``MAIN_THREAD_READ_TOOLS``.
+    Inside a sub-agent nothing is refused:
     ``AgentDefinition.tools`` already scopes what each one can reach.
     """
     from src.agent.parsec_mcp import SERVER_NAME
@@ -265,7 +274,7 @@ def delegation_guard_hook(
         if not name.startswith(prefix) or name in allowed:
             return {}
         short = name[len(prefix) :]
-        if short.startswith("db_"):
+        if short.startswith("db_") or short in MAIN_THREAD_READ_TOOLS:
             return {}
         owners = list(tool_owners.get(name) or ())
         if owners:
