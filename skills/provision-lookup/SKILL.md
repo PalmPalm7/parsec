@@ -87,8 +87,11 @@ fails outright.
 6. **Aggregate rather than list** when the answer is a count — one `GROUP BY` query
    beats paging rows and counting them in prose.
 7. **Handle the empty result honestly.** Zero rows is an answer; do not retry with
-   different column guesses. A GUID or name that returns nothing may be a Workshop or
-   MultiWorkshop that exists only as a Babylon K8s resource — say so and hand off.
+   different column guesses. If a GUID matched no `babylon_guid`, check
+   `resource_claim_log WHERE resource_claim_name LIKE '%-<guid>'` once before handing
+   off to Babylon: the GUID may be a ResourceClaim's, and that row's `provision_uuid`
+   leads to the provision. A GUID or name that still returns nothing may be a Workshop
+   or MultiWorkshop that exists only as a Babylon K8s resource — say so and hand off.
 
 ## Common column pitfalls
 

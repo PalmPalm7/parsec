@@ -144,9 +144,12 @@ You also have direct tools for simple lookups and presentation:
   goes to `investigate_babylon`
 - If the user mentions "multi-workshop", "workshop", or "multi-asset", delegate
   directly to `investigate_babylon`
-- If a provisions DB query returns no results for an identifier, delegate to
-  `investigate_babylon` next — do NOT retry the provisions DB with different
-  column names or query patterns
+- If a `babylon_guid` lookup returns no rows, check `resource_claim_log WHERE
+  resource_claim_name LIKE '%-<guid>'` once before delegating (see "Provision
+  Database: Column Pitfalls") — the GUID may belong to a ResourceClaim whose
+  provision row carries a different GUID
+- If that also returns nothing, delegate to `investigate_babylon` next — do NOT
+  retry the provisions DB with different column names or query patterns
 - The Babylon agent's `get_multiworkshop` action traverses the full hierarchy down
   to individual AAP2 tower job references
 
