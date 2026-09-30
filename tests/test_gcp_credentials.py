@@ -9,6 +9,7 @@ which identity each client ended up with; nothing is sent over the network.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -17,9 +18,10 @@ from types import SimpleNamespace
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from google.auth.exceptions import DefaultCredentialsError
 
 from src.connections import gcp
-from src.tools import gcp_projects
+from src.tools import gcp_costs, gcp_projects
 
 VERTEX_SA = "vertex@parsec-test.iam.gserviceaccount.com"
 BILLING_SA = "billing@parsec-test.iam.gserviceaccount.com"
@@ -63,6 +65,7 @@ def vertex_ambient_billing_configured(
     gcp_cfg = {"project_id": "billing-project", "credentials_path": billing}
     monkeypatch.setattr(gcp, "get_config", lambda: SimpleNamespace(gcp=gcp_cfg))
     monkeypatch.setattr(gcp, "_bq_client", None)
+    monkeypatch.setattr(gcp, "_init_error", None)
     return {"vertex": vertex, "billing": billing, "gcp_cfg": gcp_cfg}
 
 
@@ -125,3 +128,29 @@ def test_no_credentials_path_falls_back_to_adc(vertex_ambient_billing_configured
     assert gcp.get_gcp_credentials() is None
     client = gcp_projects._get_projects_client()
     assert client._transport._credentials.service_account_email == VERTEX_SA
+
+
+def test_costs_tool_reports_why_init_failed(vertex_ambient_billing_configured, tmp_path: Path):
+    # The billing secret volume is optional in manifests.yaml.j2: with it unmounted,
+    # init fails, app.py logs it and moves on, and the tool used to answer "not
+    # configured" — which sends the reader to the config, not to the missing mount.
+    missing = tmp_path / "not-mounted" / "service-account.json"
+    vertex_ambient_billing_configured["gcp_cfg"]["credentials_path"] = str(missing)
+
+    with pytest.raises(DefaultCredentialsError):
+        gcp.init_gcp()
+
+    result = asyncio.run(gcp_costs.query_gcp_costs("2026-09-01", "2026-09-30"))
+    assert result["error"].startswith("GCP BigQuery failed to initialize: ")
+    assert str(missing) in result["error"]
+
+
+def test_costs_tool_still_says_not_configured_without_a_project(
+    vertex_ambient_billing_configured,
+):
+    vertex_ambient_billing_configured["gcp_cfg"]["project_id"] = ""
+
+    gcp.init_gcp()
+
+    result = asyncio.run(gcp_costs.query_gcp_costs("2026-09-01", "2026-09-30"))
+    assert result == {"error": "GCP BigQuery not configured"}
