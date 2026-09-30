@@ -23,6 +23,12 @@ def _patch_lifespan(monkeypatch):
     monkeypatch.setattr("src.app.lifespan", _noop_lifespan)
 
 
+@pytest.fixture(autouse=True)
+def _allow_user(monkeypatch):
+    """These tests cover the endpoints' own logic; the auth gate has its own tests."""
+    monkeypatch.setattr("src.routes.debug._check_user_allowed", AsyncMock(return_value=None))
+
+
 @pytest.fixture()
 def client(_patch_lifespan):
     """Create a TestClient with patched lifespan."""
