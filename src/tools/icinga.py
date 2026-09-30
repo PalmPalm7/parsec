@@ -47,9 +47,12 @@ _EPOCH_FIELDS: frozenset[str] = frozenset(
 )
 
 #: The only filter_expr shape get_problems can apply itself: one name equality,
-#: e.g. ``host.name == "ocpvirt7"``.
+#: e.g. ``host.name == "ocpvirt7"``. The value stops at its closing quote, so a
+#: compound such as ``host.name == "a" && service.name == "b"`` does not match
+#: and is reported as ignored, instead of being read as one host literally
+#: named ``a" && service.name == "b`` that matches nothing.
 _NAME_EQUALITY = re.compile(
-    r"""^\s*(host|service)\.(?:name|display_name)\s*==\s*(["'])(.*?)\2\s*$"""
+    r"""^\s*(host|service)\.(?:name|display_name)\s*==\s*(["'])((?:(?!\2).)*)\2\s*$"""
 )
 
 

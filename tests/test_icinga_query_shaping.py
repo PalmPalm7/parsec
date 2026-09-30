@@ -143,6 +143,26 @@ async def test_get_problems_says_when_it_ignored_a_filter_expr():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "expr",
+    [
+        'host.name == "ocpvirt7" && service.name == "odf_osd_util"',
+        'host.name == "ocpvirt7" || host.name == "ocpvirt8"',
+        "host.name == 'ocpvirt7' || host.name == 'ocpvirt8'",
+    ],
+)
+async def test_get_problems_ignores_a_compound_filter_expr_instead_of_misreading_it(expr):
+    # The model writes compound filter_exprs freely (5 of the 29 captured q05/q08
+    # query_icinga calls). Read as one host equality they matched nothing, which
+    # is a false "no problem" for a host that has one.
+    out, body = await _problems(filter_expr=expr)
+
+    assert len(_names(body)) == 7
+    assert "ignored" in out["note"]
+    assert "hint" not in out
+
+
+@pytest.mark.asyncio
 async def test_get_problems_miss_on_a_display_name_points_at_get_hosts():
     # "ocpv07" is only part of the dashboard display name; the host is ocpvirt7.
     out, body = await _problems(host="ocpv07")
