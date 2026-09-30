@@ -25,7 +25,7 @@ class TestBuildReadArgs:
         assert args["search"] == "cpu"
         assert args["host"] == "host1"
         assert args["service"] == "http"
-        assert args["filter_expr"] == 'host.name=="host1"'
+        assert args["filter_expr"] == '(host.name=="host1")'
         assert args["detailed"] is True
 
     def test_empty_params(self):
