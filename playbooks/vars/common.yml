@@ -75,6 +75,16 @@ sdk_orchestrator: true
 sdk_allow_writes: false
 sdk_timeout: 300
 
+# SDK turn budgets, rendered into the ConfigMap's agent.sdk block. The
+# ConfigMap replaces config.yaml wholesale, so these are the only values a
+# deployed pod sees. Without max_turns the orchestrator falls back to
+# anthropic.max_tool_rounds (10): on the 2026-09-30 staging run q11 hit that
+# cap after 400s and $1.66 and answered with its 156-char preamble, and
+# sub-agents capped at 11 turns returned "Let me..." instead of a report.
+sdk_max_turns: 30             # orchestrator session
+sdk_subagent_min_turns: 20    # floor for each sub-agent's cap
+sdk_turn_timeout: 900         # whole turn, sub-agents included (seconds); 0 disables
+
 # Pod sizing for the parsec container under the SDK runtime. Every turn spawns a
 # `claude` CLI (Node) subprocess next to the app, so the legacy template
 # defaults (512Mi / 500m) are too small. Measured on parsec-dev (2026-09-30):

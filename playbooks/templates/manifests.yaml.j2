@@ -35,6 +35,12 @@ data:
         orchestrator: {{ sdk_orchestrator | default(false) | bool | to_json }}
         allow_writes: {{ sdk_allow_writes | default(false) | bool | to_json }}
         timeout: {{ sdk_timeout | default(300) }}
+        # Turn budgets. Without max_turns the orchestrator falls back to
+        # anthropic.max_tool_rounds above (10); subagent_min_turns is the floor
+        # for each sub-agent's cap; turn_timeout bounds the whole turn (seconds).
+        max_turns: {{ sdk_max_turns | default(30) }}
+        subagent_min_turns: {{ sdk_subagent_min_turns | default(20) }}
+        turn_timeout: {{ sdk_turn_timeout | default(900) }}
     provision_db:
       max_rows: 500
     aws:
