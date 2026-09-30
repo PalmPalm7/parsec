@@ -1171,7 +1171,10 @@ TOOLS = [
                         "Action to perform. "
                         "get_hosts: Search/filter Icinga hosts by name or filter expression. "
                         "get_services: Search/filter Icinga services, optionally by host. "
-                        "get_problems: Get all hosts and services in non-OK state. "
+                        "get_problems: Hosts and services currently in a non-OK state, "
+                        "filtered by host and service (exact Icinga names) or by a single "
+                        "host.name/service.name equality in filter_expr; long check output "
+                        "is trimmed and truncated: true marks anything left out. "
                         "get_downtimes: Get active downtimes, optionally filtered by host/service. "
                         "get_comments: Get comments on hosts/services. "
                         "acknowledge_problem: Acknowledge a host or service problem. "
@@ -1194,19 +1197,30 @@ TOOLS = [
                 "host": {
                     "type": "string",
                     "description": (
-                        "Host name filter for get_services, get_downtimes, get_comments "
-                        "(fuzzy match)."
+                        "Exact Icinga host name (e.g. 'ocpvirt7') for get_services, "
+                        "get_problems, get_downtimes, get_comments. A dashboard display name "
+                        "such as 'ocpv07' matches nothing; resolve it with get_hosts search "
+                        "first."
                     ),
                 },
                 "service": {
                     "type": "string",
-                    "description": "Service name filter for get_downtimes, get_comments.",
+                    "description": (
+                        "Exact Icinga service name (e.g. 'odf_osd_util', not the display "
+                        "name '[ODF] OSD Util') for get_problems, get_downtimes, "
+                        "get_comments. To find a service by display name, use get_services "
+                        "with a match() filter_expr."
+                    ),
                 },
                 "filter_expr": {
                     "type": "string",
                     "description": (
-                        "Advanced Icinga filter expression for get_hosts/get_services "
-                        "(e.g. 'host.state==1' for DOWN hosts)."
+                        "Icinga filter expression for get_hosts/get_services (e.g. "
+                        "'host.state==1' for DOWN hosts, "
+                        "'match(\"*ODF*\", service.display_name)'). It is ANDed with host "
+                        "as one bracketed clause, so || stays within that host. get_problems "
+                        "applies only a single host.name or service.name equality (e.g. "
+                        "host.name == 'ocpvirt7') and reports any other expression as ignored."
                     ),
                 },
                 "detailed": {
