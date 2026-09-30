@@ -124,8 +124,9 @@ You also have direct tools for simple lookups and presentation:
 - Clarifying questions before starting an investigation
 
 **High instance count / sandbox warnings:**
-- GUIDs from sandbox warnings may not exist in the provisions DB — delegate to
-  `investigate_babylon` first to check if they are Workshop/MultiWorkshop components
+- GUIDs from sandbox warnings may not exist in the provisions DB — after the one
+  `resource_claim_log` check below, delegate to `investigate_babylon` to check if
+  they are Workshop/MultiWorkshop components
 - For high instance count investigations, dispatch to Babylon, cost, and security
   agents in parallel to get deployment status, financial impact, and abuse indicators
   simultaneously rather than sequentially
@@ -144,12 +145,12 @@ You also have direct tools for simple lookups and presentation:
   goes to `investigate_babylon`
 - If the user mentions "multi-workshop", "workshop", or "multi-asset", delegate
   directly to `investigate_babylon`
-- If a `babylon_guid` lookup returns no rows, check `resource_claim_log WHERE
-  resource_claim_name LIKE '%-<guid>'` once before delegating (see "Provision
-  Database: Column Pitfalls") — the GUID may belong to a ResourceClaim whose
-  provision row carries a different GUID
-- If that also returns nothing, delegate to `investigate_babylon` next — do NOT
-  retry the provisions DB with different column names or query patterns
+- If any provisions DB lookup returns no rows for an identifier, delegate to
+  `investigate_babylon` next — do NOT retry the provisions DB with different
+  column names or query patterns. The one exception: for a GUID that matched no
+  `babylon_guid`, first check `resource_claim_log WHERE resource_claim_name LIKE
+  '%-<guid>'` once (see "Provision Database: Column Pitfalls") — the GUID may
+  belong to a ResourceClaim whose provision row carries a different GUID
 - The Babylon agent's `get_multiworkshop` action traverses the full hierarchy down
   to individual AAP2 tower job references
 

@@ -77,6 +77,11 @@ def _section(prompt: str, heading: str, next_heading: str) -> str:
     return prompt[start : prompt.index(next_heading, start)]
 
 
+def _flat(text: str) -> str:
+    """Collapse line wrapping so assertions do not depend on where Markdown wraps."""
+    return " ".join(text.split())
+
+
 def test_aap2_flow_picks_the_job_for_the_failed_action() -> None:
     # provisions.tower_job_id is the provision job in 1274 of 1274 rows and a
     # stop/start/destroy job in 0 of 1633: sent there for a destroy failure, the agent
@@ -89,3 +94,21 @@ def test_aap2_flow_picks_the_job_for_the_failed_action() -> None:
     # The per-action DB lookup comes before any Babylon call.
     assert flow.index("FROM provision_job") < flow.index("list_anarchy_subjects")
     assert "`tower_jobs.<action>`" in flow
+
+
+def test_orchestrator_keeps_the_general_no_rows_delegate_rule() -> None:
+    # The orchestrator does not load shared_context.md, so this is its only copy of
+    # "zero rows → hand off to Babylon". Narrowed to GUIDs, a name or other identifier
+    # that found nothing had no stop rule and the model kept guessing columns.
+    prompt = get_agent_prompt("orchestrator")
+    rule = prompt[prompt.index("If any provisions DB lookup returns no rows") :]
+    rule = _flat(rule[: rule.index("\n- ")])
+
+    assert "delegate to `investigate_babylon` next" in rule
+    assert "do NOT retry the provisions DB" in rule
+    # The ResourceClaim check is the one exception, and it applies to GUIDs only.
+    assert "for a GUID that matched no `babylon_guid`, first check `resource_claim_log" in rule
+    # The sandbox-warning bullet must not send a GUID to Babylon before that check.
+    warnings = _flat(_section(prompt, "**High instance count", "**Multi-domain"))
+    assert "delegate to `investigate_babylon` first" not in warnings
+    assert "after the one `resource_claim_log` check" in warnings
