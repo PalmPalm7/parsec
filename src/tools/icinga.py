@@ -21,11 +21,15 @@ _MAX_PROBLEMS = 40
 #: returns one service's whole check result.
 _CHECK_FIELD_CHARS = 1_000
 
+#: The bridge passes a tool result of up to this many characters (of its JSON)
+#: to the model whole and cuts a longer one to its first 10,000. Mirrors
+#: orchestrator.MAX_TOOL_RESULT_CHARS, which cannot be imported here without a
+#: cycle; a test keeps the two equal.
+_BRIDGE_CAP = 100_000
+
 #: Size budget for the text of a get_problems result, measured as the bridge
-#: measures it (JSON-escaped). The bridge passes a tool result of up to
-#: 100,000 characters whole and cuts a longer one to its first 10,000
-#: (orchestrator.MAX_TOOL_RESULT_CHARS), which drops most of the objects; the
-#: margin leaves room for the counts, hint and note beside the text.
+#: measures it (JSON-escaped). Well under _BRIDGE_CAP, where a cut drops most
+#: of the objects; the margin leaves room for the counts, hint and note.
 _PROBLEMS_BUDGET = 60_000
 
 #: Icinga attributes holding Unix timestamps. Listed by name rather than "any
@@ -233,12 +237,27 @@ def _with_readable_times(value: Any, now: float, iso: bool = True) -> Any:
     return out
 
 
+def _bridge_size(result: dict[str, Any]) -> int:
+    """How long the bridge measures a tool result to be."""
+    return len(json.dumps(result, default=str))
+
+
 def _with_readable_result(raw: dict[str, Any]) -> dict[str, Any]:
-    """Add readable timestamps to a read result; errors and plain text pass through."""
+    """Add readable timestamps to a read result; errors and plain text pass through.
+
+    The times add about 4%. They must not push a result that fitted under
+    _BRIDGE_CAP over it, or the model gets the first 10,000 characters instead
+    of all of it, so such a result keeps only the ages, or no times at all.
+    """
     data = _decoded(raw)
     if data is None:
         return raw
-    return {**raw, "result": _encoded(_with_readable_times(data, time.time()))}
+    now = time.time()
+    full = {**raw, "result": _encoded(_with_readable_times(data, now))}
+    if _bridge_size(full) <= _BRIDGE_CAP or _bridge_size(raw) > _BRIDGE_CAP:
+        return full
+    ages = {**raw, "result": _encoded(_with_readable_times(data, now, iso=False))}
+    return ages if _bridge_size(ages) <= _BRIDGE_CAP else raw
 
 
 def _equals_any(wanted: str, names: list[Any]) -> bool:

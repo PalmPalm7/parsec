@@ -15,6 +15,7 @@ import pytest
 
 from src.agent.orchestrator import MAX_TOOL_RESULT_CHARS
 from src.tools.icinga import (
+    _BRIDGE_CAP,
     _MAX_PROBLEMS,
     _PROBLEMS_BUDGET,
     _with_readable_times,
@@ -313,6 +314,40 @@ async def test_service_check_times_get_iso_nested(mock_call):
     assert "execution_end_age_days" in check
     # Within a second of execution_end: not worth the extra keys.
     assert "execution_start_iso" not in check
+
+
+def test_bridge_cap_mirrors_the_orchestrator():
+    assert _BRIDGE_CAP == MAX_TOOL_RESULT_CHARS
+
+
+@pytest.mark.asyncio
+@patch("src.tools.icinga.time.time", return_value=_RUN_TIME)
+@patch("src.tools.icinga.call_tool", new_callable=AsyncMock)
+async def test_readable_times_never_push_a_result_over_the_bridge_cap(mock_call, _clock):
+    # Dev q08 had get_services results of 98,893 and 98,855 characters, under
+    # the cap. The times took them to about 103k and the model got 11k of each.
+    raw = {"result": json.dumps([_service("ocpvirt7", "odf_osd_util")], indent=2)}
+    mock_call.return_value = raw
+
+    async def read() -> dict:
+        return await query_icinga("get_services", host="ocpvirt7", detailed=True)
+
+    full = await read()
+
+    # Room for the ages but not the ISO strings: the ages stay.
+    with patch("src.tools.icinga._BRIDGE_CAP", len(json.dumps(full)) - 1):
+        ages = await read()
+    check = json.loads(ages["result"])[0]["attrs"]["last_check_result"]
+    assert "execution_end_iso" not in check
+    assert "execution_end_age_days" in check
+
+    # Room for the result as it came, and nothing more: it goes as it came.
+    with patch("src.tools.icinga._BRIDGE_CAP", len(json.dumps(raw))):
+        assert await read() == raw
+
+    # Over the cap either way: the bridge cuts it regardless, so keep the times.
+    with patch("src.tools.icinga._BRIDGE_CAP", len(json.dumps(raw)) - 1):
+        assert await read() == full
 
 
 def test_readable_times_sit_next_to_their_field_and_skip_non_timestamps():
