@@ -648,7 +648,9 @@ TOOLS = [
                         "list_deployments: List active ResourceClaims (requires namespace). "
                         "get_deployment: Get a specific ResourceClaim with full details. "
                         "list_anarchy_subjects: List AnarchySubjects (active provisions) "
-                        "across anarchy namespaces. "
+                        "across anarchy namespaces. Fastest with name + namespace from "
+                        "provisions.anarchy_subject_name/anarchy_subject_namespace (one "
+                        "GET); otherwise filter by guid. Does not filter by account_id. "
                         "list_resource_pools: List ResourcePools from poolboy namespace "
                         "(pool sizing and pre-provisioned resources). "
                         "list_workshops: List Workshops in a namespace (attendee counts, "
@@ -677,11 +679,11 @@ TOOLS = [
                     "type": "string",
                     "description": (
                         "Babylon cluster name to query. If empty, resolved from "
-                        "sandbox_comment. For list_anarchy_subjects, "
-                        "list_anarchy_actions (with guid), and get_multiworkshop, "
-                        "omit cluster to automatically search ALL configured "
-                        "clusters until found. Use query_aws_account_db to get "
-                        "the comment field first when cluster is unknown."
+                        "sandbox_comment. For list_anarchy_subjects (with name or "
+                        "guid), list_anarchy_actions (with guid), get_workshop and "
+                        "get_multiworkshop, omit cluster to automatically search ALL "
+                        "configured clusters until found. Use query_aws_account_db to "
+                        "get the comment field first when cluster is unknown."
                     ),
                 },
                 "name": {
@@ -689,7 +691,9 @@ TOOLS = [
                     "description": (
                         "Resource name. For get_component: AgnosticVComponent name "
                         "(e.g. 'clusterplatform.ocp4-aws.prod'). For get_deployment: "
-                        "ResourceClaim name."
+                        "ResourceClaim name. For list_anarchy_subjects: the AnarchySubject "
+                        "name (provisions.anarchy_subject_name, e.g. "
+                        "'agd-v2.rhacs-demo-cnv.prod-q8mz5-1'); prefer this over guid."
                     ),
                 },
                 "search": {
@@ -703,7 +707,9 @@ TOOLS = [
                     "type": "string",
                     "description": (
                         "Namespace for scoped queries. Required for list_deployments "
-                        "and get_deployment (e.g. 'clusterplatform-prod')."
+                        "and get_deployment (e.g. 'clusterplatform-prod'). For "
+                        "list_anarchy_subjects with name: the AnarchySubject namespace "
+                        "(provisions.anarchy_subject_namespace, e.g. 'babylon-anarchy-3')."
                     ),
                 },
                 "sandbox_comment": {
@@ -720,12 +726,17 @@ TOOLS = [
                 },
                 "account_id": {
                     "type": "string",
-                    "description": "Filter deployments by sandbox AWS account ID.",
+                    "description": (
+                        "list_deployments only: filter ResourceClaims in the namespace by "
+                        "sandbox AWS account ID. list_anarchy_subjects rejects it."
+                    ),
                 },
                 "guid": {
                     "type": "string",
                     "description": (
-                        "Filter deployments or AnarchySubjects by provision GUID (e.g. 'qglkb')."
+                        "Filter deployments or AnarchySubjects by provision GUID (e.g. "
+                        "'qglkb'). Without a cluster this pages through every cluster; use "
+                        "name + namespace instead when the provision row has them."
                     ),
                 },
                 "max_results": {

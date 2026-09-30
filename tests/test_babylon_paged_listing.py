@@ -111,7 +111,8 @@ def test_subject_guid_search_finds_a_match_on_a_later_page(client):
     c = client(95, page_size=10)
     result = asyncio.run(tools._list_anarchy_subjects("east", "", "", "g87", max_results=5))
     assert [s["name"] for s in result["subjects"]] == ["sub-00087"]
-    assert len(c.calls) == 10 and all(p["limit"] == 10 for p in c.calls)
+    # Pages 1-9: the match is on page 9, and a GUID scan ends with that page.
+    assert len(c.calls) == 9 and all(p["limit"] == 10 for p in c.calls)
 
 
 def test_workshop_lookup_by_name_uses_a_field_selector(client, monkeypatch):

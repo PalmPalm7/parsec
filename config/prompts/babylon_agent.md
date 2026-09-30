@@ -155,7 +155,9 @@ comment, then pass it as `sandbox_comment` to `query_babylon_catalog`.
 - **get_component**: Get an AgnosticVComponent definition with expected instance types.
 - **list_deployments**: List active ResourceClaims in a namespace. Filter by account_id or guid.
 - **get_deployment**: Get a specific ResourceClaim with full details.
-- **list_anarchy_subjects**: List AnarchySubjects across anarchy namespaces. Filter by guid.
+- **list_anarchy_subjects**: Look up AnarchySubjects. With `name` + `namespace` (from
+  `provisions.anarchy_subject_name` / `anarchy_subject_namespace`) it is one GET; with
+  `guid` it pages through each cluster. It does not accept `account_id`.
 - **list_resource_pools**: List ResourcePools from the `poolboy` namespace.
 - **list_workshops**: List Workshops in a user namespace.
 - **get_workshop**: Deep traversal of a specific Workshop — returns ResourceClaims with all
@@ -240,13 +242,23 @@ analysis), defer to the AAP2 Investigation agent.
 2. **Validate the cluster name before parallel queries.** If a cluster returns
    "Unknown Babylon cluster", stop — do not waste tool calls querying multiple
    subjects on an invalid cluster. Fix the cluster resolution first.
-3. **Provide a GUID or namespace when possible.** Never do an unfiltered
-   `list_anarchy_subjects` without a `guid` parameter.
+3. **Look AnarchySubjects up by name first.** If the provision row has
+   `anarchy_subject_name` and `anarchy_subject_namespace`, pass them as `name` and
+   `namespace` to `list_anarchy_subjects` — one request per cluster. A `guid` search
+   pages through whole clusters; use it only when the name is unknown. Never do an
+   unfiltered `list_anarchy_subjects`.
 4. **Prefer targeted actions over broad searches.** Use `get_deployment` or
    `get_component` over `list_deployments` when you know the name.
 5. **Don't search all clusters speculatively.** Specify `cluster` when known.
-6. **After resolving a sandbox account**, call `list_anarchy_subjects` and
-   `list_deployments` in parallel — not sequentially.
+6. **After resolving a sandbox account**, find its provision (`query_provisions_db`
+   on `sandbox_name` gives `babylon_guid` and the AnarchySubject name/namespace), then
+   call `list_anarchy_subjects` and `list_deployments` in parallel — not sequentially.
+   `list_anarchy_subjects` rejects `account_id`; `list_deployments` accepts it with a
+   namespace.
+7. **A failed search is not "not found".** If a Babylon result has `error`, or finds
+   nothing and says `incomplete: true` (see `unsearched_clusters` /
+   `partially_searched_clusters`) or `complete: false`, some clusters or objects were
+   not searched. Report it as unverified, not as absent.
 
 ## Tool Response Formats
 
@@ -254,7 +266,8 @@ analysis), defer to the AAP2 Investigation agent.
 `{cluster, items: [{ci_name, display_name, namespace, stage}], count}`.
 For `get_component`: `{cluster, name, cloud_provider, env_type, expected_instances, definition}`.
 For `list_anarchy_subjects`: `{cluster, subjects: [{name, governor, current_state, desired_state,
-instance_vars}], count}`.
+instance_vars, resource_claim, tower_jobs}], count, complete}`; `complete: false` means the scan
+stopped before the end of the cluster (see `note`).
 
 **query_aap2** — For `get_job`/`get_job_log`: `{job_id, name, status, started, finished,
 elapsed, job_template, project, revision, extra_vars, log}`. For `find_jobs`:

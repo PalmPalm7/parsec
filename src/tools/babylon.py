@@ -3,10 +3,12 @@
 import asyncio
 import logging
 import re
+from collections.abc import Callable
 from typing import Any
 
 import httpx
 
+from src.connections import babylon as babylon_conn
 from src.connections.babylon import (
     get_configured_clusters,
     k8s_get,
@@ -19,6 +21,27 @@ from src.connections.babylon import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Most AnarchySubjects one cluster-wide scan examines before it gives up and
+#: says so (``"complete": false``) rather than reading the rest of the cluster.
+_SUBJECT_SCAN_MAX_ITEMS = 5000
+
+#: Most AnarchyActions a cluster-wide listing reads.
+_ACTION_SCAN_MAX_ITEMS = 500
+
+#: Clusters an all-cluster lookup searches at once. One after another, a GUID
+#: miss on six clusters took the sum of six scans.
+_CLUSTER_SEARCH_CONCURRENCY = 3
+
+_ACCOUNT_ID_NOT_SUPPORTED = (
+    "list_anarchy_subjects cannot filter by account_id: the sandbox account is not an "
+    "indexed field, so it would mean reading every AnarchySubject on every cluster. "
+    "Find the provision first: query_provisions_db on provisions.sandbox_name gives "
+    "babylon_guid and anarchy_subject_name/anarchy_subject_namespace (then use "
+    "list_anarchy_subjects with name + namespace), and query_aws_account_db shows "
+    "whether the sandbox is in use (available/owner). list_deployments filters by "
+    "account_id within a namespace."
+)
 
 # Shared Babylon API group domain
 _BABYLON_DOMAIN = "babylon.gpte.redhat.com"
@@ -663,14 +686,15 @@ async def query_babylon_catalog(
                 list_workshops, list_anarchy_actions).
         cluster: Babylon cluster name. If empty, resolved from sandbox_comment
                  or uses default.
-        name: Resource name for get actions.
+        name: Resource name for get actions, or the AnarchySubject name for
+              list_anarchy_subjects (a direct lookup; with namespace, one GET).
         search: Search term for search/list actions (case-insensitive contains).
         namespace: Namespace for scoped queries. For deployments, specify the
                    user namespace (e.g., "clusterplatform-prod").
         sandbox_comment: Sandbox DynamoDB comment field — used to resolve
                          which Babylon cluster to query.
         env_type: Filter by env_type (for search/list actions).
-        account_id: Filter deployments by sandbox account ID.
+        account_id: Filter deployments by sandbox account ID (list_deployments only).
         guid: Filter deployments or AnarchySubjects by GUID.
         max_results: Maximum results to return. Default: 50.
 
@@ -681,13 +705,19 @@ async def query_babylon_catalog(
     if not configured:
         return {"error": "No Babylon clusters configured. Set babylon.clusters in config."}
 
+    # It used to be dropped silently, and each such call listed whole clusters.
+    if action == "list_anarchy_subjects" and account_id:
+        return {"error": _ACCOUNT_ID_NOT_SUPPORTED}
+
     # Resolve which cluster to query
     target_cluster = _resolve_cluster_target(cluster, sandbox_comment)
 
-    # For GUID-based searches, search all clusters until found
-    if not target_cluster and guid and action in ("list_anarchy_subjects", "list_anarchy_actions"):
-        return await _search_all_clusters_for_guid(
-            action, configured, namespace, search, guid, max_results
+    # For GUID and AnarchySubject-name lookups, search all clusters until found
+    subject_lookup = action == "list_anarchy_subjects" and bool(guid or name)
+    action_lookup = action == "list_anarchy_actions" and bool(guid)
+    if not target_cluster and (subject_lookup or action_lookup):
+        return await _search_all_clusters_for_guid_or_name(
+            action, configured, namespace, search, guid, max_results, name
         )
 
     # For get_multiworkshop/get_workshop, search all clusters if no cluster specified
@@ -717,7 +747,7 @@ async def query_babylon_catalog(
             return await _get_deployment(target_cluster, name, namespace)
         elif action == "list_anarchy_subjects":
             return await _list_anarchy_subjects(
-                target_cluster, namespace, search, guid, max_results
+                target_cluster, namespace, search, guid, max_results, name
             )
         elif action == "list_resource_pools":
             return await _list_resource_pools(target_cluster, search, max_results)
@@ -748,15 +778,20 @@ async def query_babylon_catalog(
         return {"error": f"Babylon query failed: {e}", "cluster": target_cluster}
 
 
-async def _search_all_clusters_for_guid(
+async def _search_all_clusters_for_guid_or_name(
     action: str,
     clusters: list[str],
     namespace: str,
     search: str,
     guid: str,
     max_results: int,
+    name: str = "",
 ) -> dict:
-    """Search all configured clusters for a GUID, stopping when found.
+    """Search all configured clusters for a GUID or AnarchySubject name.
+
+    Clusters are searched a few at a time, and the first cluster with a match
+    wins and cancels the rest; one after another, a miss took the sum of every
+    cluster's scan.
 
     A cluster that could not be searched is not a cluster where the GUID is
     absent. On the live pods every cluster answered 401 or failed DNS and this
@@ -764,31 +799,46 @@ async def _search_all_clusters_for_guid(
     reported as "not found".
     """
     items_key = "subjects" if action == "list_anarchy_subjects" else "actions"
-    failed: list[str] = []
-    errors: list[str] = []
+    semaphore = asyncio.Semaphore(_CLUSTER_SEARCH_CONCURRENCY)
 
-    for cluster_name in clusters:
-        try:
-            if action == "list_anarchy_subjects":
-                result = await _list_anarchy_subjects(
-                    cluster_name, namespace, search, guid, max_results
-                )
-            else:
-                result = await _list_anarchy_actions(
-                    cluster_name, namespace, search, guid, max_results
-                )
-        except Exception as e:
-            result = {"error": str(e)}
+    async def search_one(cluster_name: str) -> tuple[str, dict]:
+        async with semaphore:
+            try:
+                if action == "list_anarchy_subjects":
+                    result = await _list_anarchy_subjects(
+                        cluster_name, namespace, search, guid, max_results, name
+                    )
+                else:
+                    result = await _list_anarchy_actions(
+                        cluster_name, namespace, search, guid, max_results
+                    )
+            except Exception as e:
+                result = {"error": str(e)}
+            return cluster_name, result
 
-        if result.get(items_key):
-            return result
-        if "error" in result:
-            failed.append(cluster_name)
-            errors.extend(f"{cluster_name}: {e}" for e in result.get("errors") or [result["error"]])
+    tasks = [asyncio.create_task(search_one(c)) for c in clusters]
+    outcomes: dict[str, dict] = {}
+    try:
+        for next_done in asyncio.as_completed(tasks):
+            cluster_name, result = await next_done
+            if result.get(items_key):
+                return result
+            outcomes[cluster_name] = result
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    failed = [c for c in clusters if "error" in outcomes[c]]
+    partial = [c for c in clusters if c not in failed and outcomes[c].get("complete") is False]
+    errors = [
+        f"{c}: {e}" for c in failed for e in outcomes[c].get("errors") or [outcomes[c]["error"]]
+    ]
+    target = f"AnarchySubject '{name}'" if items_key == "subjects" and name else f"GUID '{guid}'"
 
     if failed and len(failed) == len(clusters):
         return {
-            "error": f"Could not search any Babylon cluster for GUID '{guid}': every "
+            "error": f"Could not search any Babylon cluster for {target}: every "
             "cluster failed, so this is not a 'not found'.",
             "errors": errors,
         }
@@ -800,9 +850,13 @@ async def _search_all_clusters_for_guid(
         "truncated": False,
         "errors": errors if errors else None,
     }
-    if failed:
+    if failed or partial:
         out["incomplete"] = True
+    if failed:
         out["unsearched_clusters"] = failed
+    if partial:
+        # Scanned up to the cap without reaching the end of the cluster.
+        out["partially_searched_clusters"] = partial
     return out
 
 
@@ -1022,19 +1076,127 @@ async def _get_deployment(cluster: str, name: str, namespace: str) -> dict:
     return {"cluster": cluster, "deployment": info}
 
 
+async def _get_anarchy_subject(cluster: str, name: str, namespace: str) -> dict:
+    """Look up one AnarchySubject by name: a GET with a namespace, else a field selector.
+
+    ``provisions.anarchy_subject_name``/``anarchy_subject_namespace`` give both, and
+    this is one request where a GUID search pages through the whole cluster.
+    """
+    try:
+        if namespace:
+            try:
+                items = [
+                    await k8s_get_resource(
+                        cluster,
+                        ANARCHY_SUBJECT_GROUP,
+                        ANARCHY_SUBJECT_VERSION,
+                        ANARCHY_SUBJECT_PLURAL,
+                        namespace,
+                        name,
+                    )
+                ]
+            except httpx.HTTPStatusError as e:
+                if not _is_not_found(e):
+                    raise
+                items = []
+        else:
+            listing = await k8s_list_cluster_wide(
+                cluster,
+                ANARCHY_SUBJECT_GROUP,
+                ANARCHY_SUBJECT_VERSION,
+                ANARCHY_SUBJECT_PLURAL,
+                field_selector=f"metadata.name={name}",
+            )
+            items = [
+                i for i in listing.get("items", []) if i.get("metadata", {}).get("name") == name
+            ]
+    except Exception as e:
+        return {
+            "error": f"Could not look up AnarchySubject {name} on {cluster}: {e}",
+            "cluster": cluster,
+            "errors": [str(e)],
+        }
+
+    subjects = [_extract_anarchy_subject_info(item) for item in items]
+    return {
+        "cluster": cluster,
+        "subjects": subjects,
+        "count": len(subjects),
+        "truncated": False,
+        "complete": True,
+        "namespaces_searched": [namespace] if namespace else "all (cluster-wide)",
+        "errors": None,
+    }
+
+
+async def _scan_subjects_cluster_wide(
+    cluster: str,
+    keep: Callable[[dict], bool],
+    filtered: list[dict],
+    guid: str,
+    max_results: int,
+) -> tuple[bool, str]:
+    """Page through a cluster's AnarchySubjects; ``keep`` appends matches to ``filtered``.
+
+    One page at a time, stopping once enough have matched: the whole list on a
+    production cluster is thousands of objects. A GUID names one provision, so
+    a GUID scan also ends with the page its first match is on (the rest of that
+    page is already in memory); a miss used to read every page of every
+    cluster. No scan examines more than :data:`_SUBJECT_SCAN_MAX_ITEMS` objects.
+
+    Returns ``(complete, note)``: whether every subject on the cluster was
+    examined, and if not, why.
+    """
+    page_size = babylon_conn.LIST_PAGE_SIZE
+    examined = 0
+    stop_at = 0
+    async for item in k8s_iter_cluster_wide(
+        cluster,
+        ANARCHY_SUBJECT_GROUP,
+        ANARCHY_SUBJECT_VERSION,
+        ANARCHY_SUBJECT_PLURAL,
+        page_size=page_size,
+        max_items=_SUBJECT_SCAN_MAX_ITEMS,
+    ):
+        examined += 1
+        if keep(item):
+            if len(filtered) >= max_results:
+                return False, ""
+            if guid and not stop_at:
+                stop_at = ((examined - 1) // page_size + 1) * page_size
+        if stop_at and examined >= stop_at:
+            return False, (
+                "Stopped after the page with the first GUID match. A provision's other "
+                "components are listed on its ResourceClaim (get_deployment)."
+            )
+
+    if examined < _SUBJECT_SCAN_MAX_ITEMS:
+        return True, ""
+    return False, (
+        f"Examined {examined} AnarchySubjects without reaching the end of the cluster. "
+        "Narrow it: look a subject up by name + namespace "
+        "(provisions.anarchy_subject_name/namespace) or pass a namespace."
+    )
+
+
 async def _list_anarchy_subjects(
     cluster: str,
     namespace: str,
     search: str,
     guid: str,
     max_results: int,
+    name: str = "",
 ) -> dict:
     """List AnarchySubjects (active provisions).
 
-    When searching by GUID or search term, uses cluster-wide listing for
-    efficiency (works across all babylon-anarchy-* namespaces automatically).
-    When a specific namespace is given, queries only that namespace.
+    With ``name``, looks that one subject up directly. When searching by GUID
+    or search term, uses cluster-wide listing for efficiency (works across all
+    babylon-anarchy-* namespaces automatically). When a specific namespace is
+    given, queries only that namespace.
     """
+    if name:
+        return await _get_anarchy_subject(cluster, name, namespace)
+
     all_subjects: list[dict] = []
     errors: list[str] = []
     namespaces_searched: list[str] | str = "all (cluster-wide)"
@@ -1077,24 +1239,19 @@ async def _list_anarchy_subjects(
         filtered.append(info)
         return True
 
+    complete, note = True, ""
     if namespace:
         for item in all_subjects:
             _keep(item)
             if len(filtered) >= max_results:
                 break
     else:
-        # Cluster-wide, one page at a time, stopping once enough have matched:
-        # the whole list on a production cluster is thousands of objects.
         try:
-            async for item in k8s_iter_cluster_wide(
-                cluster,
-                ANARCHY_SUBJECT_GROUP,
-                ANARCHY_SUBJECT_VERSION,
-                ANARCHY_SUBJECT_PLURAL,
-            ):
-                if _keep(item) and len(filtered) >= max_results:
-                    break
+            complete, note = await _scan_subjects_cluster_wide(
+                cluster, _keep, filtered, guid_str, max_results
+            )
         except Exception as e:
+            complete = False
             errors.append(f"cluster-wide: {e}")
 
     if errors and not filtered:
@@ -1105,14 +1262,18 @@ async def _list_anarchy_subjects(
             "errors": errors,
         }
 
-    return {
+    out: dict[str, Any] = {
         "cluster": cluster,
         "subjects": filtered,
         "count": len(filtered),
         "truncated": len(filtered) >= max_results,
+        "complete": complete,
         "namespaces_searched": namespaces_searched,
         "errors": errors if errors else None,
     }
+    if note:
+        out["note"] = note
+    return out
 
 
 async def _list_resource_pools(
@@ -1391,7 +1552,7 @@ async def _list_anarchy_actions(
                 ANARCHY_ACTION_GROUP,
                 ANARCHY_ACTION_VERSION,
                 ANARCHY_ACTION_PLURAL,
-                max_items=500,
+                max_items=_ACTION_SCAN_MAX_ITEMS,
             ):
                 all_actions.append(item)
         except Exception as e:
@@ -1430,6 +1591,8 @@ async def _list_anarchy_actions(
         "actions": filtered,
         "count": len(filtered),
         "truncated": len(filtered) >= max_results,
+        # At the cap the rest of the cluster was never read, so a miss is not a miss.
+        "complete": bool(namespace) or len(all_actions) < _ACTION_SCAN_MAX_ITEMS,
         "namespaces_searched": namespaces_searched,
         "errors": errors if errors else None,
     }
