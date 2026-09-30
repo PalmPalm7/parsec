@@ -14,6 +14,20 @@ logger = logging.getLogger(__name__)
 #: Most objects a get_problems result may carry; the rest are counted, not sent.
 _MAX_PROBLEMS = 40
 
+#: Most characters one check-result field (output, performance_data, command)
+#: keeps in a get_problems result. A single ocpv-pvc-usage service carried
+#: 149,345 characters of per-PVC performance data. The head of the output and
+#: of the perfdata shows what is wrong; get_services with detailed=true
+#: returns one service's whole check result.
+_CHECK_FIELD_CHARS = 1_000
+
+#: Size budget for the text of a get_problems result, measured as the bridge
+#: measures it (JSON-escaped). The bridge passes a tool result of up to
+#: 100,000 characters whole and cuts a longer one to its first 10,000
+#: (orchestrator.MAX_TOOL_RESULT_CHARS), which drops most of the objects; the
+#: margin leaves room for the counts, hint and note beside the text.
+_PROBLEMS_BUDGET = 60_000
+
 #: Icinga attributes holding Unix timestamps. Listed by name rather than "any
 #: number above 1e9" because byte counters in vars reach that size too, and
 #: execution_start / schedule_* sit within a second of execution_end.
@@ -197,23 +211,24 @@ def _is_epoch(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool) and 1e9 < value < 1e10
 
 
-def _with_readable_times(value: Any, now: float) -> Any:
+def _with_readable_times(value: Any, now: float, iso: bool = True) -> Any:
     """Copy ``value``, adding ``<field>_iso`` and ``<field>_age_days`` after each epoch field.
 
     Left with raw epoch seconds the model does the date arithmetic itself and
     gets it wrong. A negative age is in the future (next_check, a downtime's
-    end_time).
+    end_time). ``iso=False`` adds only the ages, for results short of room.
     """
     if isinstance(value, list):
-        return [_with_readable_times(item, now) for item in value]
+        return [_with_readable_times(item, now, iso) for item in value]
     if not isinstance(value, dict):
         return value
     out: dict[str, Any] = {}
     for key, item in value.items():
-        out[key] = _with_readable_times(item, now)
+        out[key] = _with_readable_times(item, now, iso)
         if key in _EPOCH_FIELDS and _is_epoch(item):
-            stamp = datetime.fromtimestamp(item, tz=UTC)
-            out[f"{key}_iso"] = stamp.isoformat(timespec="seconds")
+            if iso:
+                stamp = datetime.fromtimestamp(item, tz=UTC)
+                out[f"{key}_iso"] = stamp.isoformat(timespec="seconds")
             out[f"{key}_age_days"] = round((now - item) / 86400, 1)
     return out
 
@@ -258,23 +273,98 @@ def _problem_matches(obj: Any, host: str, service: str) -> bool:
     return True
 
 
+def _trimmed(value: Any) -> tuple[Any, bool]:
+    """Cut a string or list longer than _CHECK_FIELD_CHARS, saying how much went."""
+    if isinstance(value, str) and len(value) > _CHECK_FIELD_CHARS:
+        cut = len(value) - _CHECK_FIELD_CHARS
+        return f"{value[:_CHECK_FIELD_CHARS]}... [{cut} more characters trimmed]", True
+    if isinstance(value, list):
+        kept: list[Any] = []
+        used = 0
+        for item in value:
+            used += len(json.dumps(item, ensure_ascii=False))
+            if used > _CHECK_FIELD_CHARS:
+                break
+            kept.append(item)
+        if len(kept) < len(value):
+            return [*kept, f"... [{len(value) - len(kept)} of {len(value)} items trimmed]"], True
+    return value, False
+
+
+def _trimmed_problem(obj: Any) -> tuple[Any, bool]:
+    """Copy one get_problems object with its long check-result fields cut short."""
+    attrs = obj.get("attrs") if isinstance(obj, dict) else None
+    if not isinstance(attrs, dict) or not isinstance(attrs.get("last_check_result"), dict):
+        return obj, False
+    check: dict[str, Any] = attrs["last_check_result"]
+    short: dict[str, Any] = {}
+    cut_any = False
+    for key, value in check.items():
+        short[key], cut = _trimmed(value)
+        cut_any = cut_any or cut
+    if not cut_any:
+        return obj, False
+    return {**obj, "attrs": {**attrs, "last_check_result": short}}, True
+
+
+def _fit_problems(
+    layout: dict[str, Any], entries: list[tuple[str, Any]], bare: bool, now: float
+) -> tuple[str, int]:
+    """Render the longest leading run of ``entries`` that fits _PROBLEMS_BUDGET.
+
+    Returns the result text and how many entries it holds. Timestamps get both
+    ``_iso`` and ``_age_days`` unless that would cost an object; then only the
+    ages stay, because a whole problem is worth more than a second rendering
+    of its check time.
+    """
+
+    def render(count: int, iso: bool) -> str:
+        sent = entries[:count]
+        shaped = {
+            key: (
+                [obj for section, obj in sent if section == key] if isinstance(objs, list) else objs
+            )
+            for key, objs in layout.items()
+        }
+        return _encoded(_with_readable_times(shaped[""] if bare else shaped, now, iso))
+
+    def fits(count: int, iso: bool) -> bool:
+        return len(json.dumps(render(count, iso))) <= _PROBLEMS_BUDGET
+
+    for iso in (True, False):
+        if fits(len(entries), iso):
+            return render(len(entries), iso), len(entries)
+    # Size grows with the count, so binary-search the largest count that fits.
+    low, high = 0, len(entries)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if fits(mid, False):
+            low = mid
+        else:
+            high = mid - 1
+    return render(low, False), low
+
+
 def _filter_problems(
     raw: dict[str, Any], host: str, service: str, filter_expr: str
 ) -> dict[str, Any]:
-    """Apply the caller's filters to a get_problems result and cap how much of it is sent.
+    """Apply the caller's filters to a get_problems result and bound what is sent.
 
     ``filter_expr`` is honoured only as a single host or service name equality;
     anything else is reported back as ignored rather than silently dropped.
+    The result is bounded by size as well as count: long check output is
+    trimmed and objects past _PROBLEMS_BUDGET are counted, not sent, with
+    ``truncated: true`` whenever anything was left out.
     """
     data = _decoded(raw)
     if data is None:
         return raw
 
-    note = ""
+    notes: list[str] = []
     if filter_expr:
         equality = _NAME_EQUALITY.match(filter_expr)
         if equality is None:
-            note = (
+            notes.append(
                 "get_problems cannot evaluate filter_expr, so it was ignored; use "
                 "get_services or get_hosts for filter expressions."
             )
@@ -285,31 +375,48 @@ def _filter_problems(
 
     # The server returns {"hosts": [...], "services": [...]}; a bare list is
     # handled the same way as a single section.
-    sections = data if isinstance(data, dict) else {"": data}
-    kept: dict[str, Any] = {}
-    room, matched = _MAX_PROBLEMS, 0
-    for key, objs in sections.items():
-        if not isinstance(objs, list):
-            kept[key] = objs
-            continue
-        hits = [obj for obj in objs if _problem_matches(obj, host, service)]
-        matched += len(hits)
-        kept[key] = hits[:room]
-        room -= len(kept[key])
+    layout = data if isinstance(data, dict) else {"": data}
+    hits = [
+        (key, obj)
+        for key, objs in layout.items()
+        if isinstance(objs, list)
+        for obj in objs
+        if _problem_matches(obj, host, service)
+    ]
+    # Trim before adding readable times, so the budget goes on problems rather
+    # than on perfdata, and so the times are never what gets cut.
+    entries: list[tuple[str, Any]] = []
+    cuts: list[bool] = []
+    for key, obj in hits[:_MAX_PROBLEMS]:
+        short, cut = _trimmed_problem(obj)
+        entries.append((key, short))
+        cuts.append(cut)
+    text, sent = _fit_problems(layout, entries, not isinstance(data, dict), time.time())
+    trimmed = any(cuts[:sent])
 
-    shaped = kept if isinstance(data, dict) else kept[""]
-    out: dict[str, Any] = {**raw, "result": _encoded(_with_readable_times(shaped, time.time()))}
-    if matched > _MAX_PROBLEMS:
+    out: dict[str, Any] = {**raw, "result": text}
+    if trimmed or sent < len(hits):
         out["truncated"] = True
-        out["total_matches"] = matched
-    if host and matched == 0:
+    if sent < len(hits):
+        out["total_matches"] = len(hits)
+        notes.append(
+            f"Only {sent} of {len(hits)} matching problems are listed; pass host or "
+            "service to narrow the call."
+        )
+    if trimmed:
+        notes.append(
+            f"Check-result fields longer than {_CHECK_FIELD_CHARS} characters were "
+            "trimmed; get_services with host, filter_expr 'service.name == \"<name>\"' "
+            "and detailed=true returns one service's full check result."
+        )
+    if host and not hits:
         out["hint"] = (
             f"No current problem matched these filters. If {host!r} is a dashboard display "
             f"name, look up the Icinga host name with get_hosts search={host!r} and filter "
             "on that."
         )
-    if note:
-        out["note"] = note
+    if notes:
+        out["note"] = " ".join(notes)
     return out
 
 

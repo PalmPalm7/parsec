@@ -44,12 +44,14 @@ operation. Use the exact action names; invented ones like `search_alerts`,
 `get_service_details` or `get_service` fail.
 - Read: `get_hosts`, `get_services`, `get_problems`, `get_downtimes`, `get_comments`
   (plus `search`, `host`, `service`, `filter_expr` with `match()`, `detailed`).
-  `get_problems` honours `host` and `service` and returns at most 40 objects, with
-  `truncated: true` when there were more.
+  `get_problems` honours `host` and `service`, returns at most 40 objects and trims check
+  output and perfdata over 1,000 characters, with `truncated: true` when anything was left
+  out; `get_services` with `detailed: true` gives one service's full check result.
 - Gated write (see Write Operations): `acknowledge_problem`, `schedule_downtime`,
   `reschedule_check`, `add_comment`, `remove_comment`, `remove_downtime`.
-- Timestamps come with `<field>_iso` (UTC) and `<field>_age_days` beside them. Quote
-  those for dates and ages; do not convert epoch seconds yourself.
+- Timestamps come with `<field>_age_days` beside them, and `<field>_iso` (UTC) unless a
+  large `get_problems` result had no room. Quote those for dates and ages; do not convert
+  epoch seconds yourself.
 
 **GitHub:**
 - `mcp__parsec__fetch_github_file`: fetch a monitoring script, an Icinga config file, or

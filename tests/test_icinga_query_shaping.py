@@ -13,7 +13,13 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.tools.icinga import _MAX_PROBLEMS, _with_readable_times, query_icinga
+from src.agent.orchestrator import MAX_TOOL_RESULT_CHARS
+from src.tools.icinga import (
+    _MAX_PROBLEMS,
+    _PROBLEMS_BUDGET,
+    _with_readable_times,
+    query_icinga,
+)
 
 # A comment the live deployment returned for replica4; its age at the run was
 # 57 days, which the model reported as "~62 days" and "~9 months".
@@ -21,7 +27,9 @@ _ENTRY_TIME = 1785871211.720291
 _RUN_TIME = _ENTRY_TIME + 57 * 86400
 
 
-def _service(host: str, name: str, state: int = 2) -> dict:
+def _service(
+    host: str, name: str, state: int = 2, output: str = "CRITICAL", perfdata: list | None = None
+) -> dict:
     return {
         "attrs": {
             "host_name": host,
@@ -30,7 +38,8 @@ def _service(host: str, name: str, state: int = 2) -> dict:
             "last_check_result": {
                 "execution_start": 1790794049.671225,
                 "execution_end": 1790794049.747915,
-                "output": "CRITICAL",
+                "output": output,
+                "performance_data": perfdata or [],
             },
         },
         "joins": {},
@@ -183,6 +192,74 @@ async def test_get_problems_is_capped_and_says_so(mock_call):
     assert len(body["services"]) == _MAX_PROBLEMS
     assert out["truncated"] is True
     assert out["total_matches"] == _MAX_PROBLEMS + 10
+
+
+def _pvc_usage(host: str) -> dict:
+    """A service shaped like ocpvirt8!ocpv-pvc-usage: 2,017 perfdata items, 149k chars."""
+    perfdata = [f"sandbox-{i:05d}-ocp4-cluster/prime-{i:032x}=41%;80;90;0;100" for i in range(2017)]
+    output = "[CRITICAL] 1 unhealthy PVC/PV: sandbox-ltrsl-ocp4-cluster (Lost)\n" + "x" * 5000
+    return _service(host, "ocpv-pvc-usage", output=output, perfdata=perfdata)
+
+
+@pytest.mark.asyncio
+@patch("src.tools.icinga.call_tool", new_callable=AsyncMock)
+async def test_get_problems_trims_long_check_fields_and_says_so(mock_call):
+    # host=ocpvirt8 on the live payload was 3 objects and 192,825 chars; the
+    # bridge cut it to its first 10,000, so later services never arrived.
+    big = _pvc_usage("ocpvirt8")
+    mock_call.return_value = {
+        "result": json.dumps({"hosts": [], "services": [big, _service("ocpvirt8", "later")]})
+    }
+
+    out = await query_icinga("get_problems", host="ocpvirt8")
+
+    services = json.loads(out["result"])["services"]
+    assert [s["name"] for s in services] == ["ocpvirt8!ocpv-pvc-usage", "ocpvirt8!later"]
+    check = services[0]["attrs"]["last_check_result"]
+    assert check["output"].startswith("[CRITICAL] 1 unhealthy PVC/PV")
+    assert check["output"].endswith("more characters trimmed]")
+    perfdata = check["performance_data"]
+    assert perfdata[0] == big["attrs"]["last_check_result"]["performance_data"][0]
+    assert perfdata[-1] == f"... [{2017 - (len(perfdata) - 1)} of 2017 items trimmed]"
+    # Times are added after trimming, so they are never what gets cut.
+    assert "execution_end_iso" in check
+    assert out["truncated"] is True
+    assert "detailed=true" in out["note"]
+    assert len(json.dumps(out)) < 20_000
+
+
+@pytest.mark.asyncio
+@patch("src.tools.icinga.call_tool", new_callable=AsyncMock)
+async def test_get_problems_is_bounded_by_size_not_only_count(mock_call):
+    services = [_pvc_usage(f"ocpvirt{i}") for i in range(_MAX_PROBLEMS)]
+    mock_call.return_value = {"result": json.dumps({"hosts": [], "services": services})}
+
+    out = await query_icinga("get_problems")
+
+    assert len(json.dumps(out["result"])) <= _PROBLEMS_BUDGET
+    assert len(json.dumps(out)) < MAX_TOOL_RESULT_CHARS
+    sent = [s["name"] for s in json.loads(out["result"])["services"]]
+    assert 0 < len(sent) < _MAX_PROBLEMS
+    assert sent == [s["name"] for s in services[: len(sent)]]
+    assert out["truncated"] is True
+    assert out["total_matches"] == _MAX_PROBLEMS
+    assert f"Only {len(sent)} of {_MAX_PROBLEMS}" in out["note"]
+
+
+@pytest.mark.asyncio
+@patch("src.tools.icinga.time.time", return_value=_RUN_TIME)
+async def test_get_problems_drops_iso_times_before_it_drops_a_problem(_clock):
+    full, full_body = await _problems()
+    assert "execution_end_iso" in full_body["services"][0]["attrs"]["last_check_result"]
+
+    with patch("src.tools.icinga._PROBLEMS_BUDGET", len(json.dumps(full["result"])) - 1):
+        out, body = await _problems()
+
+    assert _names(body) == _names(full_body)
+    check = body["services"][0]["attrs"]["last_check_result"]
+    assert "execution_end_iso" not in check
+    assert "execution_end_age_days" in check
+    assert "truncated" not in out
 
 
 @pytest.mark.asyncio
