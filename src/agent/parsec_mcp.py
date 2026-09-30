@@ -156,6 +156,7 @@ def _make_handler(name: str, allow_writes: bool) -> Callable[[dict], Awaitable[d
                 stats.calls += 1
                 stats.errors += 1
             return refusal
+        _log_permitted_write(_name, args)
 
         sink = sse_sink.get()
         if sink is not None:
@@ -199,6 +200,25 @@ def _refuse_write(name: str, args: dict, allow_writes: bool) -> dict | None:
         ],
         "is_error": True,
     }
+
+
+def _log_permitted_write(name: str, args: dict) -> None:
+    """Leave a trace of every Icinga write that goes through.
+
+    Refusals were logged and permitted writes were not, so a deployment with
+    writes switched on changed live monitoring state without a line in the
+    log. parsec-dev ran exactly that way, enabled by a hand-set env var.
+    """
+    if name != "query_icinga":
+        return
+    action = str(args.get("action", ""))
+    if action not in WRITE_ACTIONS:
+        return
+    if args.get("comment_name"):
+        target = f"comment {args['comment_name']!r}"
+    else:
+        target = f"{args.get('object_type') or '?'} {args.get('name') or '?'!r}"
+    logger.warning("Permitted Icinga write action %r on %s", action, target)
 
 
 async def _dispatch_cached(name: str, args: dict) -> dict:
