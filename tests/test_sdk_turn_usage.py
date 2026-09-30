@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -137,17 +138,41 @@ def test_delegated_sub_agents_are_recorded_in_order_with_repeats(monkeypatch):
 # ------------------------------------------------------------- log line
 
 
-def test_usage_line_leads_with_conversation_id_and_status(caplog):
+#: run_cache_test.py's parser (parsec-parity-v2 and rhdp-parsec-integration,
+#: eval/scripts), verbatim: it needs runtime, agent and the counters contiguous.
+_RUN_CACHE_TEST_USAGE = re.compile(
+    r"usage runtime=(?P<rt>\S+) agent=(?P<agent>\S+) in=(?P<in>\d+) out=(?P<out>\d+) "
+    r"cache_read=(?P<cr>\d+) cache_write=(?P<cw>\d+) cache_hit=(?P<hit>[\d.]+)% "
+    r"tools=(?P<tools>\d+) errors=(?P<errs>\d+) cost_usd=(?P<cost>[\d.]+)"
+)
+
+
+def _usage_line(caplog, c: MetricsCollector) -> str:
+    with caplog.at_level(logging.INFO, logger="src.metrics.collector"):
+        c.log_summary()
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("usage ")]
+    return line
+
+
+def test_usage_line_keeps_its_head_and_carries_conversation_id_and_status(caplog):
+    """Existing readers match "usage runtime=" and the counters after it, so the
+    new fields go on the end; the e2e harness joins on conversation_id."""
     c = MetricsCollector(conversation_id="conv-q13", runtime="sdk", agent_type="orchestrator")
     c.status = "error"
     c.record_sub_agents(["aap2", "babylon"])
+    c.record_tokens(input_tokens=10, output_tokens=9586)
+    c.record_cost(3.9339)
 
-    with caplog.at_level(logging.INFO, logger="src.metrics.collector"):
-        c.log_summary()
+    line = _usage_line(caplog, c)
 
-    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("usage ")]
-    assert line.startswith("usage conversation_id=conv-q13 status=error ")
-    assert "sub_agents=aap2,babylon" in line
+    assert line.startswith("usage runtime=sdk agent=orchestrator in=10 out=9586 ")
+    m = _RUN_CACHE_TEST_USAGE.search(line)
+    assert m and m["cost"] == "3.9339"
+    # e2e_openshift.join_usage's own parse: whitespace-split k=v after "usage ".
+    fields = dict(kv.split("=", 1) for kv in line.split("usage ", 1)[1].split() if "=" in kv)
+    assert fields["conversation_id"] == "conv-q13"
+    assert fields["status"] == "error"
+    assert fields["sub_agents"] == "aap2,babylon"
 
 
 # --------------------------------------------------- whole-turn behaviour

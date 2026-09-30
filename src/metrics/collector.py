@@ -206,21 +206,22 @@ class MetricsCollector:
         impossible to observe anywhere. This keeps them in the log regardless of
         whether the tracking server answers.
 
-        The conversation id and status lead the line: without them, costs from
-        the e2e run had to be paired with questions by log adjacency, and an
-        overlapping request made that ambiguous.
+        Readers match the head of the line, so it stays exactly as it was and
+        new fields only ever go on the end. The e2e harness filters on "usage
+        runtime=", and run_cache_test.py (parsec-parity-v2, rhdp-parsec-
+        integration) matches "usage runtime=… agent=… in=… … cost_usd=…" as one
+        regex. The conversation id and status are on the end: without them, costs
+        from the e2e run had to be paired with questions by log adjacency, and
+        an overlapping request made that ambiguous.
         """
         cached_in = self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
         hit_pct = (self.cache_read_tokens / cached_in * 100) if cached_in else 0.0
         logger.info(
-            "usage conversation_id=%s status=%s runtime=%s agent=%s sub_agents=%s "
-            "in=%d out=%d cache_read=%d cache_write=%d "
-            "cache_hit=%.1f%% tools=%d errors=%d cost_usd=%.4f latency_ms=%.0f",
-            self.conversation_id or "-",
-            self.status or "-",
+            "usage runtime=%s agent=%s in=%d out=%d cache_read=%d cache_write=%d "
+            "cache_hit=%.1f%% tools=%d errors=%d cost_usd=%.4f latency_ms=%.0f "
+            "conversation_id=%s status=%s sub_agents=%s",
             self.runtime or "-",
             self.agent_type or "-",
-            self.sub_agents or "-",
             self.input_tokens,
             self.output_tokens,
             self.cache_read_tokens,
@@ -230,6 +231,9 @@ class MetricsCollector:
             self.tool_errors,
             self.resolved_cost_usd(),
             self.total_latency_ms,
+            self.conversation_id or "-",
+            self.status or "-",
+            self.sub_agents or "-",
         )
 
     async def flush_to_mlflow(self) -> None:
