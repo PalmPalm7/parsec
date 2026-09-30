@@ -21,6 +21,29 @@ _FORBIDDEN_PATTERN = re.compile(
 
 _ROW_COUNT_PATTERN = re.compile(r"(\d+) rows? returned")
 
+#: String literals, quoted identifiers and comments, matched left to right the
+#: way the SQL lexer would. None of them can contain executable SQL, so they are
+#: blanked before the keyword and statement checks.
+#:
+#: The keyword check used to scan the raw text, so a catalog item named
+#: ``...-cluster`` or ``... (Cluster)`` in a WHERE clause read as the CLUSTER
+#: command and the query was refused — and RHDP catalog names are full of
+#: "cluster". Postgres only ever makes a literal or comment *longer* than these
+#: patterns do (E'' backslash escapes, nested /* */), never shorter, so any
+#: disagreement leaves more text to be checked as code: it fails closed.
+_NON_CODE_PATTERN = re.compile(
+    r"'(?:[^']|'')*'"  # string literal, '' as an escaped quote
+    r'|"(?:[^"]|"")*"'  # quoted identifier
+    r"|--[^\n]*"  # line comment
+    r"|/\*.*?\*/",  # block comment
+    re.DOTALL,
+)
+
+
+def _code_only(sql: str) -> str:
+    """``sql`` with literals, quoted identifiers and comments replaced by a space."""
+    return _NON_CODE_PATTERN.sub(" ", sql)
+
 
 def validate_sql(sql: str) -> str | None:
     """Validate that SQL is a read-only SELECT. Returns error message or None."""
@@ -32,11 +55,12 @@ def validate_sql(sql: str) -> str | None:
     if first_word not in ("SELECT", "WITH"):
         return f"Only SELECT queries allowed, got: {first_word}"
 
-    match = _FORBIDDEN_PATTERN.search(stripped)
+    code = _code_only(stripped)
+    match = _FORBIDDEN_PATTERN.search(code)
     if match:
         return f"Forbidden SQL keyword: {match.group()}"
 
-    if ";" in stripped:
+    if ";" in code:
         return "Multiple statements not allowed"
 
     return None
