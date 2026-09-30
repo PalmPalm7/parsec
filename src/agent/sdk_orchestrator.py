@@ -394,7 +394,7 @@ async def run_agent_via_sdk(
     event names, same ordering, same terminating ``history`` + ``done`` pair, so
     ``routes/query.py`` and the frontend are unchanged.
     """
-    from src.agent.parsec_mcp import ToolStats, sse_sink, tool_stats
+    from src.agent.parsec_mcp import ToolStats, sse_sink, tool_stats, turn_conversation_id
     from src.agent.sdk_stream import SdkEventTranslator
     from src.agent.streaming import sse_done, sse_error
     from src.config import get_config
@@ -452,6 +452,8 @@ async def run_agent_via_sdk(
     token = sse_sink.set(translator.push)
     stats = ToolStats()
     stats_token = tool_stats.set(stats)
+    # So the bridge's Icinga write audit can name the conversation it acts for.
+    conversation_token = turn_conversation_id.set(collector.conversation_id or None)
     # Connectors remember a target that failed for good (401/403, DNS) for the
     # rest of this turn and no longer. Opened before the client starts, like the
     # two above, so the bridge's handler tasks share it.
@@ -494,6 +496,7 @@ async def run_agent_via_sdk(
             collector.tool_errors += stats.errors
             sse_sink.reset(token)
             tool_stats.reset(stats_token)
+            turn_conversation_id.reset(conversation_token)
             turn_state.end_turn(dead_token)
             _tool_cache.reset(cache_token)
 

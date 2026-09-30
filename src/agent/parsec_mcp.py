@@ -67,6 +67,14 @@ class ToolStats:
 #: path reported ``tool_calls=0`` to MLflow for every turn, however many it made.
 tool_stats: ContextVar[ToolStats | None] = ContextVar("parsec_mcp_tool_stats", default=None)
 
+#: The conversation the current turn belongs to, set by the caller alongside
+#: :data:`tool_stats` (and with the same before-``create_task`` rule). A handler
+#: has no other way to tell which conversation, and so which user, a call came
+#: from; with overlapping requests, log adjacency cannot tell either.
+turn_conversation_id: ContextVar[str | None] = ContextVar(
+    "parsec_mcp_conversation_id", default=None
+)
+
 #: The only state-mutating surface Parsec exposes. These are enum values of the
 #: ``action`` argument on a single ``query_icinga`` tool, not separate tools, so
 #: no ``allowed_tools`` / ``disallowed_tools`` list can express them — the gate
@@ -203,22 +211,40 @@ def _refuse_write(name: str, args: dict, allow_writes: bool) -> dict | None:
 
 
 def _log_permitted_write(name: str, args: dict) -> None:
-    """Leave a trace of every Icinga write that goes through.
+    """Leave a trace of every Icinga write the SDK bridge lets through.
 
     Refusals were logged and permitted writes were not, so a deployment with
     writes switched on changed live monitoring state without a line in the
     log. parsec-dev ran exactly that way, enabled by a hand-set env var.
+
+    The line carries the conversation id; the route's "Query from user=…
+    conversation_id=…" line maps that to the person who asked. Every value is
+    model or request input, so each is ``%r``-quoted: a raw newline in any of
+    them would otherwise print a second, forged audit line.
+
+    SDK bridge only. The legacy runtime sends Icinga calls through
+    ``orchestrator._execute_tool`` straight to ``tools.icinga.query_icinga``,
+    which has neither this audit nor the write gate in :func:`_refuse_write`;
+    that path is out of scope here.
     """
     if name != "query_icinga":
         return
     action = str(args.get("action", ""))
     if action not in WRITE_ACTIONS:
         return
-    if args.get("comment_name"):
-        target = f"comment {args['comment_name']!r}"
+    # Name what query_icinga will actually change: only remove_comment acts on
+    # a comment, every other write on object_type/name. Keying on whether a
+    # comment_name was sent logged a Host acknowledge against a stray comment.
+    if action == "remove_comment":
+        target = f"comment {args.get('comment_name') or '?'!r}"
     else:
-        target = f"{args.get('object_type') or '?'} {args.get('name') or '?'!r}"
-    logger.warning("Permitted Icinga write action %r on %s", action, target)
+        target = f"{args.get('object_type') or '?'!r} {args.get('name') or '?'!r}"
+    logger.warning(
+        "Permitted Icinga write action %r on %s (conversation_id=%r)",
+        action,
+        target,
+        turn_conversation_id.get() or "-",
+    )
 
 
 async def _dispatch_cached(name: str, args: dict) -> dict:
