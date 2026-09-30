@@ -15,9 +15,13 @@ reference. If unsure, call `db_describe_table` to check. Common mistakes:
 - `lifecycle_log` joins to provisions via `provision_uuid` (the provision's `uuid`, NOT
   the `babylon_guid`). It has `state`, `executor`, `logged_at` and `comments` — NO
   `action`, `event_type`, `message` or `timestamp`.
-- `tower_job_log` and `provision_job` column names are camelCase and MUST be
-  double-quoted: `"deployerJob"`, `"towerHost"`, `"towerJobURL"`, `"jobStatus"`.
-  Unquoted, Postgres folds `deployerJob` to `deployerjob`, which does not exist.
+- `tower_job_log` and `provision_job` mix camelCase and snake_case column names. The
+  camelCase ones MUST be double-quoted: `"deployerJob"`, `"towerHost"`, `"towerJobURL"`
+  (both tables), and `"jobStatus"`, `"startTimestamp"`, `"completeTimestamp"`
+  (`provision_job` only). Unquoted, Postgres folds `deployerJob` to `deployerjob`,
+  which does not exist. Every other column in both tables is lowercase snake_case and
+  is written unquoted — e.g. `provision_uuid`, `action`, `runtime_hour`,
+  `extra_vars_json`, `created_at`.
 - `tower_job_log` has NO `provision_uuid` and does not join to provisions. A
   provision's own AAP2 job is `provisions.tower_job_id` / `tower_job_url`; its
   per-action jobs are in `provision_job` (`pj.provision_uuid = p.uuid`, one row per

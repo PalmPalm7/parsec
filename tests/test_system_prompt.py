@@ -135,3 +135,32 @@ def test_provision_lookup_skill_says_ordered_by_is_the_requester_email() -> None
     skill = PROVISION_LOOKUP_SKILL.read_text()
     assert ORDERED_BY_FACT in skill
     assert "user's name is in `ordered_by`" not in skill
+
+
+# db_describe_table in staging q13: every mixed-case column of tower_job_log and
+# provision_job. Each one fails unquoted, exactly as "deployerJob" did.
+QUOTED_JOB_COLUMNS = (
+    "deployerJob",
+    "towerHost",
+    "towerJobURL",
+    "jobStatus",
+    "startTimestamp",
+    "completeTimestamp",
+)
+
+
+@pytest.mark.parametrize("column", QUOTED_JOB_COLUMNS)
+def test_pitfalls_list_every_camel_case_job_column(column: str) -> None:
+    # The orchestrator has no other source for these, so check its prompt: a model
+    # asking "when did the job run" reaches for startTimestamp before anything else.
+    pitfalls = get_agent_prompt("orchestrator")
+    pitfalls = _flat(pitfalls[pitfalls.index("## Provision Database: Column Pitfalls") :])
+    assert f'`"{column}"`' in pitfalls
+
+
+def test_pitfalls_say_the_other_job_columns_are_snake_case() -> None:
+    # "column names are camelCase" invited quoting provision_uuid and action too.
+    pitfalls = get_agent_prompt("orchestrator")
+    pitfalls = _flat(pitfalls[pitfalls.index("## Provision Database: Column Pitfalls") :])
+    assert "column names are camelCase" not in pitfalls
+    assert "Every other column in both tables is lowercase snake_case" in pitfalls
