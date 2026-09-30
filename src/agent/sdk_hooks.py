@@ -23,7 +23,16 @@ driving the pinned CLI 2.1.169 (and the wheel's bundled 2.1.185):
   model with that tool result;
 * a ``PreToolUse`` deny stops the call before the tool runs, and the model
   gets ``permissionDecisionReason`` back as an error tool result. Hooks run
-  even for tools in ``allowed_tools``, which ``can_use_tool`` does not.
+  even for tools in ``allowed_tools``, which ``can_use_tool`` does not;
+* a sub-agent's own transcript is
+  ``<dirname(transcript_path)>/<session_id>/subagents/agent-<agent_id>.jsonl``
+  (``transcript_path`` is the orchestrator's). Each tool_use block of one model
+  response is its own ``"type": "assistant"`` line, and all of them carry that
+  response's ``message.id``, so distinct ids count turns. The CLI buffers those
+  writes: a line reached disk about 100 ms after it was made, so when a fast
+  tool's ``PostToolUse`` fires its own line is usually not on disk yet (26 of 27
+  calls in two local runs), and the turn's text line only sometimes is. The
+  CLI keeps flushing while it waits for a hook's answer.
 
 The second hook here uses that: the orchestrator's main thread may call only
 its own direct tools. Every bridged tool is approved session-wide so that
@@ -35,8 +44,11 @@ the cost agent and its spend workflow never loaded; dev q06 ran
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
@@ -49,7 +61,99 @@ logger = logging.getLogger(__name__)
 #: and one turn to write the report, the same margin the legacy warning leaves.
 BUDGET_WARNING_MARGIN = 3
 
+#: Tool calls per turn assumed when a sub-agent's transcript cannot be read.
+#: Live sub-agents batch their calls: the staging cost and babylon agents made
+#: 1-4 per turn, mostly 2-3. Counting one call as one turn warned them at turn
+#: 6-9 of 20, and they obeyed at once, so a call count alone gives back the
+#: early cut-off the 20-turn floor removed.
+FALLBACK_CALLS_PER_TURN = 2
+
+#: How long a hook waits for the CLI to write the call's own transcript line,
+#: and how often it looks. Only a call within one turn of the threshold waits:
+#: until its line lands, the call may belong to the last turn on disk or to the
+#: next, and guessing either way warns a turn early or a turn late.
+_FLUSH_WAIT_S = 0.5
+_FLUSH_POLL_S = 0.02
+
 _POST_TOOL_EVENTS: tuple[HookEvent, ...] = ("PostToolUse", "PostToolUseFailure")
+
+
+def _subagent_transcript(input_data: Any) -> Path | None:
+    """Where the CLI writes this sub-agent's own transcript, if the input says."""
+    transcript = str(input_data.get("transcript_path") or "")
+    session_id = str(input_data.get("session_id") or "")
+    agent_id = str(input_data.get("agent_id") or "")
+    if not (transcript and session_id and agent_id):
+        return None
+    return Path(transcript).parent / session_id / "subagents" / f"agent-{agent_id}.jsonl"
+
+
+class _TurnCounter:
+    """One sub-agent's turns, read from its transcript a few new lines at a time.
+
+    A turn is one model response. The CLI writes each of its tool_use blocks as
+    a separate ``assistant`` line, all with the response's ``message.id``, so
+    three parallel calls are one id and one turn.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._offset = 0
+        #: message id -> 1-based turn number, in the order the turns appear.
+        self._turns: dict[str, int] = {}
+        #: tool_use id -> the turn that made it.
+        self._calls: dict[str, int] = {}
+
+    @property
+    def turns(self) -> int:
+        """Turns on disk so far."""
+        return len(self._turns)
+
+    def turn_of(self, tool_use_id: str) -> int | None:
+        return self._calls.get(tool_use_id)
+
+    def read(self) -> bool:
+        """Take in whatever the CLI has written since; False if it cannot be read."""
+        try:
+            with self._path.open("rb") as fh:
+                fh.seek(self._offset)
+                chunk = fh.read()
+        except OSError:
+            return False
+        # Whole lines only. A line the CLI is still writing is read next time.
+        end = chunk.rfind(b"\n") + 1
+        for line in chunk[:end].splitlines():
+            # Tool results are the long lines and never "assistant" entries;
+            # skip parsing most of them.
+            if b'"assistant"' in line:
+                self._take(line)
+        self._offset += end
+        return True
+
+    async def wait_for(self, tool_use_id: str, timeout: float) -> int | None:
+        """The turn that made ``tool_use_id``, once its line lands, or None."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while (turn := self.turn_of(tool_use_id)) is None and loop.time() < deadline:
+            await asyncio.sleep(_FLUSH_POLL_S)
+            if not self.read():
+                return None
+        return turn
+
+    def _take(self, line: bytes) -> None:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            return
+        message = entry.get("message")
+        if not isinstance(message, dict) or not message.get("id"):
+            return
+        turn = self._turns.setdefault(str(message["id"]), len(self._turns) + 1)
+        for block in message.get("content") or ():
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id"):
+                self._calls[str(block["id"])] = turn
 
 
 def budget_warning_hook(
@@ -57,17 +161,43 @@ def budget_warning_hook(
 ) -> HookCallback:
     """A post-tool hook that tells a sub-agent to stop and report near its limit.
 
-    ``turn_limits`` maps ``agent_type`` to that agent's ``maxTurns``. Tool
-    calls, not turns, are counted: the hook never sees a turn boundary, and a
-    turn that calls tools calls at least one, so the count reaches the
-    threshold no later than the turn count would. It errs early, never late.
+    ``turn_limits`` maps ``agent_type`` to that agent's ``maxTurns``. The
+    warning goes out once per agent, with the first tool result of turn
+    ``maxTurns - margin``. Turns come from the sub-agent's transcript, because
+    the hook itself sees calls, not turns. If the transcript cannot be read,
+    it fires at ``FALLBACK_CALLS_PER_TURN`` times that many calls instead.
 
     State lives in the closure, so build one per orchestrator turn.
     """
     from src.agent.agents import BUDGET_WARNING
 
     calls: dict[str, int] = {}
+    counters: dict[str, _TurnCounter] = {}
     warned: set[str] = set()
+
+    async def _turn(agent_id: str, input_data: Any, tool_use_id: str, threshold: int) -> int | None:
+        """The turn this call belongs to, or at least whether it reaches ``threshold``.
+
+        ``None`` when the transcript cannot be read or holds no turn yet.
+        """
+        counter = counters.get(agent_id)
+        if counter is None:
+            path = _subagent_transcript(input_data)
+            if path is None:
+                return None
+            counter = counters[agent_id] = _TurnCounter(path)
+        if not counter.read() or not counter.turns:
+            return None
+        turn = counter.turn_of(tool_use_id)
+        if turn is not None:
+            return turn
+        # Not on disk yet, so this call is in the last turn on disk or the next.
+        latest = counter.turns + 1
+        if latest < threshold:
+            return latest
+        # Either answer decides the warning, so wait for the line. If it never
+        # lands, count the next turn: one turn early is safe, one late is not.
+        return await counter.wait_for(tool_use_id, _FLUSH_WAIT_S) or latest
 
     async def _hook(input_data: Any, tool_use_id: str | None, context: Any) -> dict[str, Any]:
         agent_id = str(input_data.get("agent_id") or "")
@@ -80,14 +210,29 @@ def budget_warning_hook(
         if not limit:
             return {}
         calls[agent_id] = calls.get(agent_id, 0) + 1
-        if agent_id in warned or calls[agent_id] < limit - margin:
+        if agent_id in warned:
             return {}
+        threshold = limit - margin
+        call_id = str(tool_use_id or input_data.get("tool_use_id") or "")
+        try:
+            turn = await _turn(agent_id, input_data, call_id, threshold)
+        except Exception:  # a hook that raises would fail the tool call it follows
+            logger.warning("SDK budget warning: cannot count turns of %s", agent_id, exc_info=True)
+            turn = None
+        if turn is not None:
+            if turn < threshold:
+                return {}
+            basis = f"turn {turn}"
+        else:
+            if calls[agent_id] < threshold * FALLBACK_CALLS_PER_TURN:
+                return {}
+            basis = f"call {calls[agent_id]} (transcript unreadable)"
         warned.add(agent_id)
         logger.info(
-            "SDK budget warning: %s agent %s at %d tool calls of %d turns",
+            "SDK budget warning: %s agent %s at %s of %d turns",
             agent_type,
             agent_id,
-            calls[agent_id],
+            basis,
             limit,
         )
         event = str(input_data.get("hook_event_name") or "PostToolUse")

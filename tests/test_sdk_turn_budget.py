@@ -17,6 +17,7 @@ no equivalent.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -114,12 +115,106 @@ def test_orchestrator_is_told_not_to_redo_a_specialists_work():
 # ------------------------------------------------------- budget warning hook
 
 
+class _SubagentRun:
+    """A sub-agent run whose transcript is laid out and written as CLI 2.1.169 does.
+
+    The CLI passes the orchestrator's ``transcript_path`` and ``session_id`` in
+    every hook input; the sub-agent's own transcript sits beside it under
+    ``<session_id>/subagents/agent-<agent_id>.jsonl``. Each tool_use block of a
+    response is written as its own ``assistant`` line carrying the response's
+    ``message.id``, then its tool_result. The CLI buffers those writes: in two
+    local runs a fast tool's own line was on disk for 1 of 27 PostToolUse
+    events, and landed about 100 ms later.
+    """
+
+    def __init__(self, root, agent_id: str = "a1", agent_type: str = "cost") -> None:
+        self.agent_id, self.agent_type = agent_id, agent_type
+        self.main = root / "s.jsonl"
+        self.path = root / "s" / "subagents" / f"agent-{agent_id}.jsonl"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.turn = 0
+        self._write({"type": "user", "message": {"role": "user", "content": "task"}})
+
+    def _write(self, entry: dict) -> None:
+        entry.update(isSidechain=True, agentId=self.agent_id, sessionId="s")
+        with self.path.open("a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+
+    def _assistant(self, msg_id: str, block: dict) -> None:
+        self._write(
+            {
+                "type": "assistant",
+                "message": {"id": msg_id, "role": "assistant", "content": [block]},
+            }
+        )
+
+    def hook_input(self, tool_use_id: str, event: str = "PostToolUse") -> dict:
+        return {
+            "hook_event_name": event,
+            "session_id": "s",
+            "transcript_path": str(self.main),
+            "cwd": "/app",
+            "tool_name": "mcp__parsec__query_aws_costs",
+            "tool_input": {},
+            "tool_use_id": tool_use_id,
+            "agent_id": self.agent_id,
+            "agent_type": self.agent_type,
+        }
+
+    async def turn_with(
+        self, hook, calls: int, event: str = "PostToolUse", lag: float | None = 0.0
+    ) -> list[dict]:
+        """One model response making ``calls`` parallel tool calls.
+
+        ``lag=0`` writes each call's line before its hook fires. A positive
+        ``lag`` writes it that many seconds after the hook fires, as the CLI's
+        buffered writer does; ``None`` only after the hook has returned.
+        """
+        loop = asyncio.get_running_loop()
+        self.turn += 1
+        msg_id = f"msg_{self.turn:03d}"
+        self._assistant(msg_id, {"type": "text", "text": "Checking."})
+        outputs = []
+        for i in range(calls):
+            tool_use_id = f"tu_{self.turn}_{i}"
+            use = {"type": "tool_use", "id": tool_use_id, "name": "q", "input": {}}
+            pending = [True]
+
+            def write_use(msg_id=msg_id, use=use, pending=pending) -> None:
+                if pending[0]:
+                    pending[0] = False
+                    self._assistant(msg_id, use)
+
+            if lag == 0:
+                write_use()
+            elif lag is not None:
+                loop.call_later(lag, write_use)
+            outputs.append(await hook(self.hook_input(tool_use_id, event), tool_use_id, {}))
+            write_use()  # the line precedes the tool_result, whenever it lands
+            result = {"type": "tool_result", "tool_use_id": tool_use_id, "content": "x" * 50}
+            self._write({"type": "user", "message": {"role": "user", "content": [result]}})
+        return outputs
+
+    async def turns(self, hook, n: int, calls: int = 3, **kw) -> list[list[dict]]:
+        return [await self.turn_with(hook, calls, **kw) for _ in range(n)]
+
+
+def _warned_turns(per_turn: list[list[dict]]) -> list[tuple[int, int]]:
+    """(turn, call within turn), 1-based, wherever the warning was injected."""
+    return [
+        (t + 1, c + 1)
+        for t, outputs in enumerate(per_turn)
+        for c, out in enumerate(outputs)
+        if (out.get("hookSpecificOutput") or {}).get("additionalContext")
+    ]
+
+
 def _post(agent_id: str | None, agent_type: str = "cost", event: str = "PostToolUse") -> dict:
-    """A hook input shaped like the pinned CLI's (2.1.169)."""
+    """A hook input whose transcript does not exist, so no turn can be read."""
     data = {
         "hook_event_name": event,
         "session_id": "s",
-        "transcript_path": "/tmp/t.jsonl",
+        "transcript_path": "/nonexistent/parsec-test/t.jsonl",
         "cwd": "/app",
         "tool_name": "mcp__parsec__query_aws_costs",
         "tool_input": {},
@@ -143,20 +238,71 @@ def _warned(outputs: list[dict]) -> list[int]:
     ]
 
 
-async def test_warning_is_injected_once_three_turns_before_the_limit():
+async def test_warning_counts_turns_when_each_turn_makes_parallel_calls(tmp_path):
+    """Live sub-agents make 2-3 calls per turn; the warning must still wait for turn 17.
+
+    Counting calls instead warned the staging cost agents at turn 6-7 of 20
+    (call 17), and the model stops as soon as it is told to.
+    """
     from src.agent.agents import BUDGET_WARNING
     from src.agent.sdk_hooks import budget_warning_hook
 
     hook = budget_warning_hook({"cost": 20})
-    outputs = await _fire(hook, _post("a1"), 20)
+    per_turn = await _SubagentRun(tmp_path).turns(hook, 20, calls=3)
 
-    assert _warned(outputs) == [17]
-    out = outputs[16]["hookSpecificOutput"]
+    assert _warned_turns(per_turn) == [(17, 1)]
+    out = per_turn[16][0]["hookSpecificOutput"]
     assert out["hookEventName"] == "PostToolUse"
     assert out["additionalContext"] == BUDGET_WARNING
 
 
-async def test_failed_tool_calls_count_and_can_carry_the_warning():
+async def test_one_call_per_turn_is_warned_at_the_same_turn(tmp_path):
+    from src.agent.sdk_hooks import budget_warning_hook
+
+    hook = budget_warning_hook({"cost": 20})
+    assert _warned_turns(await _SubagentRun(tmp_path).turns(hook, 20, calls=1)) == [(17, 1)]
+
+
+async def test_a_call_whose_line_lands_while_the_hook_waits_gets_its_own_turn(tmp_path):
+    """The CLI writes a call's line after its PostToolUse, but the turn's text before.
+
+    Counting the unwritten call as one more turn then counted the turn twice and
+    warned at turn 16 of a local run's widget agent; near the threshold the
+    hook waits for the line instead.
+    """
+    from src.agent.sdk_hooks import budget_warning_hook
+
+    hook = budget_warning_hook({"cost": 20})
+    per_turn = await _SubagentRun(tmp_path).turns(hook, 20, calls=3, lag=0.03)
+
+    assert _warned_turns(per_turn) == [(17, 1)]
+
+
+async def test_a_line_that_never_lands_is_counted_early_not_late(tmp_path, monkeypatch):
+    """If the wait runs out, count the next turn: warning a turn early still
+    leaves a turn for the report, a turn late may not."""
+    import src.agent.sdk_hooks as sdk_hooks
+
+    monkeypatch.setattr(sdk_hooks, "_FLUSH_WAIT_S", 0.03)
+    hook = sdk_hooks.budget_warning_hook({"cost": 20})
+    per_turn = await _SubagentRun(tmp_path).turns(hook, 20, calls=3, lag=None)
+
+    assert _warned_turns(per_turn) == [(16, 1)]
+
+
+async def test_calls_far_from_the_threshold_do_not_wait_for_the_transcript(tmp_path, monkeypatch):
+    import src.agent.sdk_hooks as sdk_hooks
+
+    monkeypatch.setattr(sdk_hooks, "_FLUSH_WAIT_S", 5.0)
+    hook = sdk_hooks.budget_warning_hook({"cost": 20})
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await _SubagentRun(tmp_path).turns(hook, 14, calls=3, lag=None)
+
+    assert loop.time() - started < 1.0
+
+
+async def test_failed_tool_calls_count_and_can_carry_the_warning(tmp_path):
     """A result with is_error fires PostToolUseFailure, not PostToolUse.
 
     Observed with the pinned CLI: a bridged tool returning is_error=True never
@@ -166,10 +312,57 @@ async def test_failed_tool_calls_count_and_can_carry_the_warning():
     from src.agent.sdk_hooks import budget_warning_hook
 
     hook = budget_warning_hook({"cost": 20})
-    outputs = await _fire(hook, _post("a1", event="PostToolUseFailure"), 17)
+    per_turn = await _SubagentRun(tmp_path).turns(hook, 17, calls=2, event="PostToolUseFailure")
 
-    assert _warned(outputs) == [17]
-    assert outputs[16]["hookSpecificOutput"]["hookEventName"] == "PostToolUseFailure"
+    assert _warned_turns(per_turn) == [(17, 1)]
+    assert per_turn[16][0]["hookSpecificOutput"]["hookEventName"] == "PostToolUseFailure"
+
+
+async def test_unreadable_transcript_falls_back_to_twice_the_calls():
+    """No transcript: assume two calls per turn, so warn at call 34, not call 17."""
+    from src.agent.sdk_hooks import FALLBACK_CALLS_PER_TURN, budget_warning_hook
+
+    hook = budget_warning_hook({"cost": 20})
+    assert _warned(await _fire(hook, _post("a1"), 40)) == [17 * FALLBACK_CALLS_PER_TURN] == [34]
+
+
+async def test_input_without_a_transcript_path_falls_back_too():
+    from src.agent.sdk_hooks import budget_warning_hook
+
+    data = _post("a1")
+    del data["transcript_path"]
+    hook = budget_warning_hook({"cost": 20})
+    assert _warned(await _fire(hook, data, 40)) == [34]
+
+
+def test_turn_counter_leaves_a_half_written_line_for_the_next_read(tmp_path):
+    from src.agent.sdk_hooks import _TurnCounter
+
+    path = tmp_path / "agent-a1.jsonl"
+    line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"id": "m1", "content": [{"type": "tool_use", "id": "t1"}]},
+        }
+    )
+    path.write_text(line[:25])
+    counter = _TurnCounter(path)
+
+    assert counter.read() and counter.turns == 0
+    path.write_text(line + "\n")
+    assert counter.read() and counter.turns == 1
+    assert counter.turn_of("t1") == 1
+
+
+def test_turn_counter_ignores_lines_it_cannot_parse(tmp_path):
+    from src.agent.sdk_hooks import _TurnCounter
+
+    path = tmp_path / "agent-a1.jsonl"
+    good = {"type": "assistant", "message": {"id": "m1", "content": []}}
+    path.write_text('{"type": "assistant", broken\n["assistant"]\n' + json.dumps(good) + "\n")
+
+    counter = _TurnCounter(path)
+    assert counter.read() and counter.turns == 1
 
 
 async def test_main_thread_calls_are_never_warned():
@@ -177,34 +370,38 @@ async def test_main_thread_calls_are_never_warned():
     from src.agent.sdk_hooks import budget_warning_hook
 
     hook = budget_warning_hook({"cost": 20})
-    assert _warned(await _fire(hook, _post(None), 40)) == []
+    assert _warned(await _fire(hook, _post(None), 80)) == []
 
 
-async def test_parallel_agents_of_one_type_are_counted_separately():
+async def test_parallel_agents_of_one_type_are_counted_separately(tmp_path):
     from src.agent.sdk_hooks import budget_warning_hook
 
     hook = budget_warning_hook({"babylon": 20})
-    first = await _fire(hook, _post("a1", "babylon"), 10)
-    second = await _fire(hook, _post("a2", "babylon"), 10)
+    first = _SubagentRun(tmp_path, "a1", "babylon")
+    second = _SubagentRun(tmp_path, "a2", "babylon")
+    early = await first.turns(hook, 10) + await second.turns(hook, 10)
 
-    assert _warned(first) == [] and _warned(second) == []
-    assert _warned(await _fire(hook, _post("a1", "babylon"), 7)) == [7]
+    assert _warned_turns(early) == []
+    assert _warned_turns(await first.turns(hook, 7)) == [(7, 1)]
 
 
-async def test_unknown_agent_type_is_left_alone():
+async def test_unknown_agent_type_is_left_alone(tmp_path):
     from src.agent.sdk_hooks import budget_warning_hook
 
     hook = budget_warning_hook({"cost": 20})
-    assert _warned(await _fire(hook, _post("a1", "general-purpose"), 40)) == []
+    run = _SubagentRun(tmp_path, agent_type="general-purpose")
+    assert _warned_turns(await run.turns(hook, 20)) == []
 
 
-async def test_options_wire_the_hook_to_each_subagents_real_limit(_sdk_stub):
+async def test_options_wire_the_hook_to_each_subagents_real_limit(_sdk_stub, tmp_path):
     opts = _options(_cfg())
 
     assert {"PostToolUse", "PostToolUseFailure"} <= set(opts.hooks)
     hook = opts.hooks["PostToolUse"][0].hooks[0]
-    assert _warned(await _fire(hook, _post("c1", "cost"), 20)) == [17]
-    assert _warned(await _fire(hook, _post("x1", "aap2"), 23)) == [20]
+    cost = _SubagentRun(tmp_path, "c1", "cost")
+    aap2 = _SubagentRun(tmp_path, "x1", "aap2")
+    assert _warned_turns(await cost.turns(hook, 20)) == [(17, 1)]
+    assert _warned_turns(await aap2.turns(hook, 23)) == [(20, 1)]
 
 
 # -------------------------------------------- turn limit keeps the findings
