@@ -14,9 +14,50 @@ is remembered, and every call goes through.
 
 from __future__ import annotations
 
+import socket
 from contextvars import ContextVar, Token
 
+#: The reasons connectors record with :func:`mark_dead`. Each is a failure that
+#: repeats on every call until an operator acts, and each needs a different
+#: operator action, so the connectors word the follow-up error from it.
+CREDENTIALS_REJECTED = "credentials rejected (HTTP 401)"
+HOST_NOT_FOUND = "host name does not resolve"
+CONNECTION_REFUSED = "connection refused"
+
 _dead: ContextVar[dict[str, str] | None] = ContextVar("parsec_dead_targets", default=None)
+
+
+def permanent_connect_failure(exc: BaseException) -> str | None:
+    """:data:`HOST_NOT_FOUND` or :data:`CONNECTION_REFUSED` if ``exc`` is final, else ``None``.
+
+    httpx raises the same ``ConnectError`` for every failed connection; what
+    went wrong is the OS error further down the chain (httpx.ConnectError <-
+    httpcore.ConnectError <- socket.gaierror, or <- OSError("All connection
+    attempts failed") <- ConnectionRefusedError). Only two causes are final: a
+    name that does not exist (EAI_NONAME, as for AAP2 east/west and Babylon
+    babydev on staging) and a host that refuses the connection. A resolver
+    hiccup (EAI_AGAIN), a TLS failure or a timeout can clear on the next call,
+    and a turn can run for ten minutes, so recording those would blank out a
+    working backend for the rest of the investigation.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        # Match the class before the errno: ssl.SSLEOFError carries errno 8,
+        # which is also EAI_NONAME on macOS.
+        if isinstance(current, socket.gaierror):
+            return HOST_NOT_FOUND if current.errno == socket.EAI_NONAME else None
+        if isinstance(current, ConnectionRefusedError):
+            return CONNECTION_REFUSED
+        if isinstance(current, BaseExceptionGroup):
+            # anyio tries every address a name resolves to (IPv6 and IPv4) and
+            # groups the failures. Final only if every attempt failed the same
+            # final way; one timed-out address could still answer next time.
+            reasons = {permanent_connect_failure(e) for e in current.exceptions}
+            return reasons.pop() if len(reasons) == 1 else None
+        current = current.__cause__ or current.__context__
+    return None
 
 
 def begin_turn() -> Token[dict[str, str] | None]:

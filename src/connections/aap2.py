@@ -111,11 +111,6 @@ async def _get_client(cluster_name: str) -> httpx.AsyncClient:
     return client
 
 
-#: The reason recorded in :mod:`turn_state` for a controller that answered 401.
-#: Any other recorded reason is the text of a failed connection.
-_CREDENTIALS_REJECTED = "credentials rejected (HTTP 401)"
-
-
 def _target(cluster_name: str) -> str:
     return f"aap2:{cluster_name}"
 
@@ -123,8 +118,9 @@ def _target(cluster_name: str) -> str:
 def _unavailable_error(cluster_name: str) -> Exception | None:
     """The error to raise, without a request, for a controller already dead this turn.
 
-    Once a controller has rejected Parsec's credentials or could not be
-    connected to, every retry fails the same way until an operator acts. On
+    Once a controller has rejected Parsec's credentials, or its host name did
+    not resolve or it refused the connection, every retry fails the same way
+    until an operator acts. On
     the staging pod one question collected 47 AAP2 401s this way. The
     exception type is the one the first failure raised: PermissionError keeps
     the debug routes' 502 mapping, ConnectError keeps query_aap2's
@@ -133,18 +129,29 @@ def _unavailable_error(cluster_name: str) -> Exception | None:
     reason = turn_state.dead_reason(_target(cluster_name))
     if reason is None:
         return None
-    if reason == _CREDENTIALS_REJECTED:
+    if reason == turn_state.CREDENTIALS_REJECTED:
         return PermissionError(
             f"AAP2 controller '{cluster_name}' rejected Parsec's stored credentials (HTTP 401) "
             "earlier in this investigation, so Parsec did not call it again. Retrying will not "
             "help; an operator has to update the credentials. Report anything that depends on "
             "this controller as unverified."
         )
+    # Each cause needs a different fix, so say which one it was instead of
+    # one sentence covering both.
+    if reason == turn_state.HOST_NOT_FOUND:
+        what = (
+            "did not resolve in DNS earlier in this investigation, so Parsec did not call it "
+            "again: the host name in its configured URL does not exist. Retrying will not help; "
+            "an operator has to correct or remove this controller in Parsec's config."
+        )
+    else:  # turn_state.CONNECTION_REFUSED, the only other reason recorded here
+        what = (
+            "refused the connection earlier in this investigation, so Parsec did not call it "
+            "again: nothing is accepting connections at its configured address. Retrying will "
+            "not help; an operator has to bring the controller back or correct its URL."
+        )
     return httpx.ConnectError(
-        f"'{cluster_name}' was already unreachable earlier in this investigation ({reason}): "
-        "its host does not resolve or refuses connections, so Parsec did not call it again. "
-        "Retrying will not help; it needs an operator. Report anything that depends on this "
-        "controller as unverified."
+        f"'{cluster_name}' {what} Report anything that depends on this controller as unverified."
     )
 
 
@@ -160,7 +167,7 @@ def _check_response(resp: httpx.Response, cluster_name: str, path: str) -> None:
         # The old "Authentication failed for controller 'X'" led the model to
         # tell users the controller was not configured and to offer to add
         # credentials for it. It is configured; its credentials went stale.
-        turn_state.mark_dead(_target(cluster_name), _CREDENTIALS_REJECTED)
+        turn_state.mark_dead(_target(cluster_name), turn_state.CREDENTIALS_REJECTED)
         raise PermissionError(
             f"Parsec's configured credentials for AAP2 controller '{cluster_name}' were "
             "rejected (HTTP 401) — likely expired or rotated. The controller is configured; "
@@ -185,9 +192,12 @@ async def _get(
     try:
         resp = await client.get(path, params=params or {}, headers=headers)
     except httpx.ConnectError as e:
-        # DNS failures and refused connections: on staging the east and west
-        # controllers no longer resolve at all.
-        turn_state.mark_dead(_target(cluster_name), str(e) or type(e).__name__)
+        # On staging the east and west controllers no longer resolve at all.
+        # Only such final causes are remembered: a resolver hiccup or a TLS
+        # failure is left for the next call to retry.
+        reason = turn_state.permanent_connect_failure(e)
+        if reason is not None:
+            turn_state.mark_dead(_target(cluster_name), reason)
         raise
     _check_response(resp, cluster_name, path)
     return resp
