@@ -545,3 +545,86 @@ def test_turn_limit_without_any_delegation_is_still_one_error():
 
     assert names.count("error") == 1
     assert "Partial findings" not in json.dumps(events)
+
+
+# ------------------------------------- partial findings do not repeat a relay
+
+
+_COST = (
+    "I now have all the data needed. Let me compile the complete picture.\n\n"
+    "## Top GPU users this week\n\n"
+    "| user | instance | cost |\n| --- | --- | --- |\n"
+    "| alice | g6.12xlarge in sandbox39 | $356 ($346 metal + $10 GPU) |\n"
+    "| bob | g5.2xlarge in sandbox12 | $120 |\n\n"
+    "Root cause: sandbox39 has run a g6.12xlarge since 2026-09-24 with no owner tag.\n"
+    "Next step: ask alice@example.com to confirm, then stop i-0abc1234."
+)
+_BABYLON = "## 2w27z\n\nResourceClaim `published.ai-driven-aap.prod-2w27z` → provision 44l6l."
+
+
+def _say(tr: SdkEventTranslator, text: str) -> None:
+    list(
+        tr.translate(
+            StreamEvent(
+                uuid="u",
+                session_id="s",
+                event={
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            )
+        )
+    )
+
+
+def _delegate(tr: SdkEventTranslator, tool_use_id: str, agent_type: str, report: str) -> None:
+    use = ToolUseBlock(id=tool_use_id, name="Agent", input={"subagent_type": agent_type})
+    list(tr.translate(AssistantMessage(content=[use], model="m")))
+    result = ToolResultBlock(tool_use_id=tool_use_id, content=[{"type": "text", "text": report}])
+    list(tr.translate(UserMessage(content=[result])))
+
+
+def _saved_answer(tr: SdkEventTranslator) -> str:
+    list(tr.translate(_turn_limited(True)))
+    events = _parse(list(tr.finish(_Collector())))
+    names = [n for n, _ in events]
+    return events[names.index("history")][1]["messages"][-1]["content"]
+
+
+def test_a_relayed_report_is_not_repeated_under_partial_findings():
+    """Relay A in full, delegate B, run out of turns: A must appear once."""
+    tr = SdkEventTranslator(question="top GPU users, and what is 2w27z", history=[])
+    _delegate(tr, "t1", "cost", _COST)
+    _say(tr, "Here is the cost agent's report:\n\n" + _COST + "\n\nNow checking Babylon.")
+    _delegate(tr, "t2", "babylon", _BABYLON)
+
+    saved = _saved_answer(tr)
+
+    assert saved.count("| alice | g6.12xlarge in sandbox39 |") == 1
+    assert "## Partial findings (turn limit reached)" in saved
+    assert "Babylon Investigation" in saved and "published.ai-driven-aap.prod-2w27z" in saved
+    assert "Cost Investigation" not in saved
+
+
+def test_a_relay_that_drops_the_narration_and_rewraps_still_counts():
+    tr = SdkEventTranslator(question="q", history=[])
+    _delegate(tr, "t1", "cost", _COST)
+    body = _COST.split("\n\n", 1)[1]
+    _say(tr, "Top GPU users:\n\n" + body.replace("Next step:", "\nNext step:  "))
+
+    saved = _saved_answer(tr)
+
+    assert saved.count("| alice | g6.12xlarge in sandbox39 |") == 1
+    assert "Partial findings" not in saved
+
+
+def test_a_rewritten_relay_keeps_the_specialists_own_report():
+    """q10: the orchestrator turned "$356 ($346 metal + $10 GPU)" into "$356*"."""
+    tr = SdkEventTranslator(question="q", history=[])
+    _delegate(tr, "t1", "cost", _COST)
+    _say(tr, "Top GPU users: alice ($356*) and bob ($120). Checking owners next.")
+
+    saved = _saved_answer(tr)
+
+    assert "## Partial findings (turn limit reached)" in saved
+    assert "$356 ($346 metal + $10 GPU)" in saved

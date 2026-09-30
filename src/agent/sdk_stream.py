@@ -348,8 +348,15 @@ class SdkEventTranslator:
             return ""
         from src.agent.agents import AGENTS
 
+        # A report the orchestrator already relayed, as the delegation addendum
+        # asks, is in the answer; appending it again doubled it in the stream
+        # and in the saved history.
+        answer = "".join(self._text_parts)
+        pending = [(t, r) for t, r in self._agent_reports if not _already_relayed(r, answer)]
+        if not pending:
+            return ""
         parts = ["\n\n## Partial findings (turn limit reached)\n"]
-        for agent_type, report in self._agent_reports:
+        for agent_type, report in pending:
             cfg = AGENTS.get(agent_type)
             parts.append(f"\n### {cfg.name if cfg else agent_type}\n\n{report}\n")
         return "".join(parts)
@@ -462,6 +469,36 @@ def _turn_tokens(result: Any) -> dict[str, int]:
         entries = [usage] if isinstance(usage, dict) else []
         fields = _USAGE_FIELDS
     return {ours: sum(int(e.get(theirs) or 0) for e in entries) for ours, theirs in fields.items()}
+
+
+#: A report counts as relayed when its start, this many characters or half the
+#: report if longer, appears word for word (whitespace aside) in the answer.
+_RELAYED_PREFIX_MIN = 200
+
+
+def _squash(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _already_relayed(report: str, answer: str) -> bool:
+    """Whether the orchestrator's own text already carries this report.
+
+    The staging reports all opened with narration ("I now have all the data
+    needed. Let me compile the complete picture.") that a relay drops, so the
+    body after the opening paragraph is tried as well as the whole report.
+
+    Deliberately strict otherwise: a relay that rewrote the report is not a copy
+    of it, and the staging relays that did (q10 turned "$356 ($346 metal + $10
+    GPU)" into "$356*") are exactly when the specialist's own words are worth
+    showing.
+    """
+    said = _squash(answer)
+    _, _, body = report.strip().partition("\n\n")
+    for text in (report, body):
+        flat = _squash(text)
+        if flat and flat[: max(_RELAYED_PREFIX_MIN, len(flat) // 2)] in said:
+            return True
+    return not _squash(report)
 
 
 def _agent_report_text(content: Any) -> str:
