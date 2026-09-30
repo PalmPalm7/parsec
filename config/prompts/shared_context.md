@@ -136,8 +136,9 @@ When searching for catalog items by hostname or image name (e.g. `rh1-lb1187-rhe
 - **Destroy failures:** Check both AAP2 job events and Babylon AnarchySubject
   status in parallel for faster diagnosis.
 - **AAP2 quota exceeded (429):** If the AAP2 agent returns a rate limit error,
-  immediately pivot to direct database queries (`tower_job_log`, `lifecycle_log`)
-  rather than retrying the agent call.
+  immediately pivot to direct database queries (`provision_job` for each action's
+  job and `"jobStatus"`, `lifecycle_log` for states) rather than retrying the agent
+  call. `tower_job_log` has no `provision_uuid`, so it cannot answer per-provision.
 - **Batch GUID lookups:** When checking multiple GUIDs (e.g. retirement status),
   query them in a single `IN (...)` clause — not one tool call per GUID.
 - **Infer retired from absence:** If a GUID is missing from active results, treat

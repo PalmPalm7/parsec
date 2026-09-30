@@ -164,3 +164,13 @@ def test_pitfalls_say_the_other_job_columns_are_snake_case() -> None:
     pitfalls = _flat(pitfalls[pitfalls.index("## Provision Database: Column Pitfalls") :])
     assert "column names are camelCase" not in pitfalls
     assert "Every other column in both tables is lowercase snake_case" in pitfalls
+
+
+@pytest.mark.parametrize("agent_type", sorted(set(_AGENT_PROMPT_FILES) - {"orchestrator"}))
+def test_rate_limit_fallback_uses_a_table_that_joins_to_provisions(agent_type: str) -> None:
+    # tower_job_log has no provision_uuid (db_describe_table, staging q13), so the
+    # 429 fallback pointed sub-agents at a table that cannot be tied to a provision.
+    prompt = get_agent_prompt(agent_type)
+    fallback = _flat(prompt[prompt.index("**AAP2 quota exceeded (429):**") :].split("\n- ")[0])
+    assert "(`provision_job` for each action's job" in fallback
+    assert "direct database queries (`tower_job_log`" not in fallback
