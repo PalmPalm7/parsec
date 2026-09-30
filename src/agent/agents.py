@@ -335,6 +335,17 @@ def _extract_user_context(history: list) -> str:
     return "\n\n**Prior conversation context (user messages):**\n" + "\n---\n".join(recent)
 
 
+#: Told to a sub-agent two rounds before its limit. Shared with the SDK runtime,
+#: whose budget hook (src/agent/sdk_hooks.py) injects the same words.
+BUDGET_WARNING = (
+    "[SYSTEM: You have 2 tool rounds remaining. "
+    "You MUST write your full structured report (config trace, "
+    "failure analysis, root cause, recommendations) in your next "
+    "response. Do NOT call more tools unless absolutely critical. "
+    "A report with gaps is better than no report.]"
+)
+
+
 def _maybe_inject_budget_warning(messages: list, current_round: int, max_rounds: int) -> None:
     """Inject a budget warning when the agent is 2 rounds from the limit.
 
@@ -347,18 +358,7 @@ def _maybe_inject_budget_warning(messages: list, current_round: int, max_rounds:
 
     last_content = messages[-1].get("content")
     if isinstance(last_content, list):
-        last_content.append(
-            {
-                "type": "text",
-                "text": (
-                    "[SYSTEM: You have 2 tool rounds remaining. "
-                    "You MUST write your full structured report (config trace, "
-                    "failure analysis, root cause, recommendations) in your next "
-                    "response. Do NOT call more tools unless absolutely critical. "
-                    "A report with gaps is better than no report.]"
-                ),
-            }
-        )
+        last_content.append({"type": "text", "text": BUDGET_WARNING})
 
 
 def _compute_confidence(tool_outcomes: list[dict]) -> tuple[str, list[str]]:

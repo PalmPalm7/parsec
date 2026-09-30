@@ -85,7 +85,7 @@ def _today() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%d")
 
 
-#: Appended to every subagent prompt.
+#: Appended to every subagent prompt, formatted with that agent's turn budget.
 #:
 #: Only a subagent's FINAL message returns to the orchestrator — its tool
 #: results stay in its own context. So whatever it omits from that message is
@@ -110,7 +110,35 @@ State the root cause and the concrete next steps.
 
 Length is not a virtue, but omitting specifics is a defect — a tidy answer that
 drops the identifiers an SRE needs is worse than a long one that keeps them.
+
+You have at most {max_turns} turns; stop calling tools by turn {stop_by} and write
+the report. A run that hits the limit returns whatever you said last, and a
+"let me check one more thing" is not a report.
 """
+
+
+#: Orchestrator turns per question. Every delegation costs one on top of the
+#: orchestrator's own tool rounds, so the legacy loop's ten tool rounds
+#: (``anthropic.max_tool_rounds``) are far too few.
+DEFAULT_ORCHESTRATOR_MAX_TURNS = 30
+
+#: Floor for every sub-agent's ``maxTurns``; see ``_agent_definitions``.
+DEFAULT_SUBAGENT_MIN_TURNS = 20
+
+
+def _positive_int(raw: object, default: int, key: str) -> int:
+    """``raw`` as a positive int; unset uses ``default``, junk warns and uses it."""
+    if raw in (None, ""):
+        return default
+    try:
+        value = int(str(raw))
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not an integer; using %d", key, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("%s=%r must be positive; using %d", key, raw, default)
+        return default
+    return value
 
 
 def _agent_definitions(config: Any) -> dict[str, Any]:
@@ -128,6 +156,11 @@ def _agent_definitions(config: Any) -> dict[str, Any]:
     from src.agent.system_prompt import get_agent_prompt
 
     enabled = enabled_sdk_agents(config)
+    min_turns = _positive_int(
+        _sdk_section_of(config).get("subagent_min_turns"),
+        DEFAULT_SUBAGENT_MIN_TURNS,
+        "agent.sdk.subagent_min_turns",
+    )
     definitions: dict[str, Any] = {}
 
     for agent_type, agent_cfg in AGENTS.items():
@@ -136,6 +169,11 @@ def _agent_definitions(config: Any) -> dict[str, Any]:
             # delegate to a half-migrated agent.
             continue
 
+        # The legacy round budget plus headroom was too tight on the SDK: on
+        # the live staging pod both cost agents for "top GPU users this week"
+        # hit their 11-turn cap mid-investigation, on a question that needed
+        # 28-31 tool calls.
+        max_turns = max(agent_cfg.max_rounds + TURN_HEADROOM, min_turns)
         kwargs: dict[str, Any] = {
             "description": agent_cfg.description or f"{agent_cfg.name} specialist",
             # Same date grounding the legacy sub-agent loop appends
@@ -144,10 +182,10 @@ def _agent_definitions(config: Any) -> dict[str, Any]:
             "prompt": (
                 f"{get_agent_prompt(agent_type)}"
                 f"\n\nToday's date is {_today()}."
-                f"{_SUBAGENT_OUTPUT_CONTRACT}"
+                + _SUBAGENT_OUTPUT_CONTRACT.format(max_turns=max_turns, stop_by=max_turns - 2)
             ),
             "tools": tool_names_for(list(agent_cfg.tools)),
-            "maxTurns": agent_cfg.max_rounds + TURN_HEADROOM,
+            "maxTurns": max_turns,
         }
         skills = skills_for(agent_type)
         if skills:
@@ -176,12 +214,23 @@ def _union_tool_schemas() -> list[dict]:
     return list(seen.values())
 
 
+def _tool_owners(agents: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each bridged tool name to the enabled sub-agents that may call it."""
+    owners: dict[str, list[str]] = {}
+    for agent_type, definition in agents.items():
+        for name in definition.tools or ():
+            owners.setdefault(name, []).append(agent_type)
+    return owners
+
+
 def build_orchestrator_options(config: Any, *, system: str) -> Any:
     """Assemble ``ClaudeAgentOptions`` for one orchestrator turn."""
     from claude_agent_sdk import ClaudeAgentOptions
 
     from src.agent.parsec_mcp import SERVER_NAME, build_server, tool_names_for
+    from src.agent.sdk_hooks import build_hooks
     from src.agent.sdk_profiles import _sdk_section
+    from src.agent.tool_definitions import get_orchestrator_direct_tools
     from src.llm.agent_sdk_client import (
         AgentSdkConfig,
         backend_cli_env,
@@ -204,14 +253,25 @@ def build_orchestrator_options(config: Any, *, system: str) -> Any:
     # refused: the icinga agent reported "unable to access the monitoring system
     # due to permission restrictions" and answered with no tool calls at all.
     #
-    # This does not widen what any individual agent can reach — availability is
-    # still per-agent via `AgentDefinition.tools` (see `_agent_definitions`).
-    # Approval is session-wide; availability is per-agent.
+    # Approval is session-wide, so it does widen what the main thread can
+    # reach: the orchestrator could call every specialist tool itself, and on
+    # the live pods it did instead of delegating. Sub-agents are narrowed by
+    # `AgentDefinition.tools` (see `_agent_definitions`); the main thread is
+    # narrowed to its own direct tools by the PreToolUse guard in sdk_hooks,
+    # which also keeps every Parsec tool from the CLI's built-in agent types.
     approved_tools = tool_names_for(schemas)
+    direct_tools = tool_names_for(get_orchestrator_direct_tools())
 
     anthropic_cfg = _section_get(config, "anthropic")
     model = sdk_cfg.get("model") or anthropic_cfg.get("model") or "claude-sonnet-4-6"
-    max_turns = int(sdk_cfg.get("max_turns") or anthropic_cfg.get("max_tool_rounds") or 10)
+    # Not anthropic.max_tool_rounds: that is the legacy loop's budget of tool
+    # rounds, and every delegation costs the orchestrator turns too. Falling
+    # back to it (10) ended staging q11 at turn 11 with a 156-character
+    # preamble, after the sub-agents had already found the answer.
+    max_turns = _positive_int(
+        sdk_cfg.get("max_turns"), DEFAULT_ORCHESTRATOR_MAX_TURNS, "agent.sdk.max_turns"
+    )
+    agents = _agent_definitions(config)
 
     defaults = AgentSdkConfig(model=str(model))
     # Pin the binary here too. Without it the SDK picks the CLI bundled in its
@@ -225,7 +285,15 @@ def build_orchestrator_options(config: Any, *, system: str) -> Any:
         cli_path=cli_path,
         system_prompt=system,
         max_turns=max_turns,
-        agents=_agent_definitions(config),
+        agents=agents,
+        # Warns each sub-agent before its maxTurns, as the legacy loop does, and
+        # keeps specialist tools off the main thread and out of built-in agents.
+        hooks=build_hooks(
+            turn_limits={name: d.maxTurns for name, d in agents.items() if d.maxTurns},
+            direct_tools=direct_tools,
+            tool_owners=_tool_owners(agents),
+            specialists=agents,
+        ),
         mcp_servers={SERVER_NAME: server},
         allowed_tools=[*approved_tools, *_ORCHESTRATOR_EXTRA_TOOLS],
         # Availability, not just auto-approval — see agent_sdk_client._build_options.
@@ -293,6 +361,10 @@ def _delegation_addendum(config: Any) -> str:
         "Delegate whenever a question falls in one of those domains, exactly as the",
         "instructions above intend. Handle only cross-domain synthesis and your own",
         "direct tools yourself.",
+        "",
+        "After a specialist returns, do not repeat its tool calls yourself. If its reply",
+        "is not a finished report, delegate once more with the facts it already found,",
+        "not the original broad task.",
         "",
         "### Relay specialist findings in full",
         "",
