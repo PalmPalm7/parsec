@@ -361,3 +361,28 @@ tool calls failed and three questions cost $6.91 of $9.84, one of them ending wi
 `east`/`west` no longer resolve) — broken since at least 2026-09-02 in production too, so the aap2
 agent and Debug Automation cannot read any job; `babydev`, `ocpv05`, `ocpv10` no longer resolve;
 parsec-dev runs with a hand-set `PARSEC_AGENT__SDK__ALLOW_WRITES=true` against the live Icinga.
+
+### Turn budgets and the delegation guard
+
+Two behaviours the same test exposed, fixed separately because they change how an investigation runs:
+
+- **Budgets.** The orchestrator was capped at `anthropic.max_tool_rounds` (10) and each sub-agent at
+  `max_rounds + 3` (11 for cost/babylon), with no warning. Sub-agents hit the cap mid-investigation
+  and returned narration ("Let me look up those sandbox owners…"), the orchestrator restarted from
+  scratch, and on staging q11 it hit its own cap and answered with a one-line preamble after 400 s
+  and $1.66. Now: `agent.sdk.max_turns` (default 30) for the orchestrator,
+  `max(max_rounds + 3, agent.sdk.subagent_min_turns)` (default 20) per sub-agent, the legacy
+  "2 rounds left, write your report" warning injected by a PostToolUse hook three **turns** before a
+  sub-agent's cap (counted from its transcript, not from tool calls — sub-agents make 2–3 calls per
+  turn), and on a turn-limit stop the sub-agents' reports are kept under "Partial findings" with one
+  error instead of being thrown away.
+- **Delegation.** The orchestrator could call every specialist tool itself (one MCP server, every
+  tool approved), so it skipped the specialist — and its prompt and skills — on 3 questions. A
+  PreToolUse hook now denies bridged specialist tools on the main thread (hook input without
+  `agent_id`) and tells the model which sub-agent to use; the orchestrator keeps its own direct tools,
+  the `db_*` tools and the read-only GitHub tools. Built-in sub-agent types (e.g. `general-purpose`)
+  cannot run Parsec tools either, so the guard cannot be sidestepped.
+
+Hook semantics were verified against the pinned CLI 2.1.169 before relying on them: hooks fire for
+in-process MCP tools; sub-agent calls carry `agent_id`/`agent_type`, main-thread calls do not; a
+deny stops the tool before it runs; a failed tool fires `PostToolUseFailure`, not `PostToolUse`.
