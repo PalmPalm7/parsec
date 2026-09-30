@@ -34,7 +34,9 @@ _PROBLEMS_BUDGET = 60_000
 
 #: Icinga attributes holding Unix timestamps. Listed by name rather than "any
 #: number above 1e9" because byte counters in vars reach that size too, and
-#: execution_start / schedule_* sit within a second of execution_end.
+#: execution_start / schedule_* are left out: they sit within seconds or
+#: minutes of execution_end (21 s on one live check), which is
+#: indistinguishable at the day resolution of _age_days.
 _EPOCH_FIELDS: frozenset[str] = frozenset(
     {
         "entry_time",

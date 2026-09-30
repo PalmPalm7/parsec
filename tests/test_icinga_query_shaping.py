@@ -345,7 +345,7 @@ async def test_service_check_times_get_iso_nested(mock_call):
     check = json.loads(out["result"])[0]["attrs"]["last_check_result"]
     assert check["execution_end_iso"] == "2026-09-30T18:47:29+00:00"
     assert "execution_end_age_days" in check
-    # Within a second of execution_end: not worth the extra keys.
+    # Seconds or minutes from execution_end: the same age at day resolution.
     assert "execution_start_iso" not in check
 
 
