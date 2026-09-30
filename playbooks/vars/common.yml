@@ -79,10 +79,15 @@ sdk_timeout: 300
 # ConfigMap replaces config.yaml wholesale, so these are the only values a
 # deployed pod sees. Without max_turns the orchestrator falls back to
 # anthropic.max_tool_rounds (10): on the 2026-09-30 staging run q11 hit that
-# cap after 400s and $1.66 and answered with its 156-char preamble, and
-# sub-agents capped at 11 turns returned "Let me..." instead of a report.
+# cap after 400s and $1.66 and answered with its 156-char preamble.
+#
+# sdk_subagent_min_turns is read only by an orchestrator build that has the
+# SDK turn-budget change; there it raises each orchestrated sub-agent's cap to
+# at least this many turns (on that run, sub-agents capped at max_rounds + 3 =
+# 11 returned "Let me..." instead of a report). Code without that change
+# ignores the key, so setting it alone does not raise any cap.
 sdk_max_turns: 30             # orchestrator session
-sdk_subagent_min_turns: 20    # floor for each sub-agent's cap
+sdk_subagent_min_turns: 20    # sub-agent cap floor; inert without the turn-budget change
 sdk_turn_timeout: 900         # whole turn, sub-agents included (seconds); 0 disables
 
 # Opt-in NetworkPolicy (parsec-api-ingress) for the app port: only the

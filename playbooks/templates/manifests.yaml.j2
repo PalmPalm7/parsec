@@ -36,8 +36,11 @@ data:
         allow_writes: {{ sdk_allow_writes | default(false) | bool | to_json }}
         timeout: {{ sdk_timeout | default(300) }}
         # Turn budgets. Without max_turns the orchestrator falls back to
-        # anthropic.max_tool_rounds above (10); subagent_min_turns is the floor
-        # for each sub-agent's cap; turn_timeout bounds the whole turn (seconds).
+        # anthropic.max_tool_rounds above (10); turn_timeout bounds the whole
+        # turn (seconds, 0 disables). subagent_min_turns only matters to an
+        # orchestrator build that reads it (the SDK turn-budget change): there
+        # it floors each orchestrated sub-agent's cap. Code without that change
+        # ignores the key, and each sub-agent keeps its max_rounds + 3.
         max_turns: {{ sdk_max_turns | default(30) }}
         subagent_min_turns: {{ sdk_subagent_min_turns | default(20) }}
         turn_timeout: {{ sdk_turn_timeout | default(900) }}
