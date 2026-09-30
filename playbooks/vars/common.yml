@@ -74,3 +74,17 @@ sdk_enabled_agents: ["all"]
 sdk_orchestrator: true
 sdk_allow_writes: false
 sdk_timeout: 300
+
+# Pod sizing for the parsec container under the SDK runtime. Every turn spawns a
+# `claude` CLI (Node) subprocess next to the app, so the legacy template
+# defaults (512Mi / 500m) are too small. Measured on parsec-dev (2026-09-30):
+# the container sat at its 512Mi limit through every question (cgroup
+# memory.max hit >23,000 times), and a Babylon delegation starved the event
+# loop long enough to fail three liveness probes — the kubelet restarted the
+# pod mid-investigation. The same question completed on a 2-CPU / 3Gi pod.
+# Matches the sizing parsec-sdk-e2e.yaml already uses for this runtime.
+# Override per environment in dev.yml / prod.yml.
+deployment_memory_request: "1Gi"
+deployment_memory_limit: "3Gi"
+deployment_cpu_request: "500m"
+deployment_cpu_limit: "2"

@@ -280,13 +280,15 @@ spec:
             - name: ocpv-kubeconfigs
               mountPath: /app/ocpv
               readOnly: true
+          # Defaults fit the legacy runtime; common.yml sizes the pod for the SDK
+          # runtime, which runs a `claude` CLI subprocess beside the app per turn.
           resources:
             requests:
               memory: "{{ deployment_memory_request | default('256Mi') }}"
-              cpu: "100m"
+              cpu: "{{ deployment_cpu_request | default('100m') }}"
             limits:
               memory: "{{ deployment_memory_limit | default('512Mi') }}"
-              cpu: "500m"
+              cpu: "{{ deployment_cpu_limit | default('500m') }}"
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
