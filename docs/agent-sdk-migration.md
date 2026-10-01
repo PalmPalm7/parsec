@@ -431,3 +431,9 @@ on where `install_root` and `state_path` point: in `playbooks/templates/manifest
 **Image runtime contract.** The Dockerfile's verify step asserts `git`, a writable `$HOME`, Node,
 that the `claude` on `PATH` is the pinned `CLAUDE_CODE_VERSION`, and the seeded `/app/.claude/skills`. Rebasing onto another base image (the
 ubi9-minimal work in #29) must keep all of them, or the image build fails.
+
+**Replacement safety and CI.** Install and uninstall use the same per-skill file lock across
+workers. A replacement is copied into hidden staging with its provenance before the previous
+copy moves; a failed copy or swap preserves the previous install. The next install recovers a
+previous copy left by an interrupted swap. CI runs the Python and JavaScript suites, formatting,
+lint and types, builds the image, and imports the full FastAPI application from that image.

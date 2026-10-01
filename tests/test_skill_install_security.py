@@ -23,7 +23,9 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -703,6 +705,113 @@ def test_a_staged_copy_is_never_discovered(tmp_path):
     ).load_all()
 
     assert [m.skill_path for m in manifests] == [install_root / "good-skill"]
+
+
+def test_concurrent_reinstalls_keep_payload_and_provenance_together(tmp_path, monkeypatch):
+    """A second worker cannot delete the first worker's completed staging copy."""
+    root = tmp_path / "installed"
+    root.mkdir()
+    sources = [tmp_path / label for label in ("a", "b")]
+    for src in sources:
+        _skill_md(src, "good-skill")
+        (src / "payload").write_text(src.name)
+    copied = threading.Event()
+    second_started = threading.Event()
+    release = threading.Event()
+    real_copy = skills_routes.copy_skill_tree
+
+    def pause_first(src, dest):
+        links = real_copy(src, dest)
+        if src == sources[0]:
+            copied.set()
+            assert release.wait(5)
+        return links
+
+    def install(src):
+        if src == sources[1]:
+            second_started.set()
+        return skills_routes._replace_skill_dir(
+            src, root / "good-skill", root / ".staging", {"source": src.name}
+        )
+
+    monkeypatch.setattr(skills_routes, "copy_skill_tree", pause_first)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(install, sources[0])
+        assert copied.wait(5)
+        second = pool.submit(install, sources[1])
+        assert second_started.wait(5)
+        try:
+            # Without the lock, the second worker finishes while the first is
+            # paused, deleting its staging directory in the process.
+            second.result(timeout=0.2)
+        except TimeoutError:
+            pass
+        finally:
+            release.set()
+        assert first.result(timeout=5) == []
+        assert second.result(timeout=5) == []
+    dest = root / "good-skill"
+    assert (dest / "payload").read_text() == "b"
+    assert json.loads((dest / ".parsec-provenance.json").read_text())["source"] == "b"
+    assert list((root / ".staging").iterdir()) == []
+
+
+def test_provenance_failure_preserves_previous_install(tmp_path, monkeypatch):
+    root = tmp_path / "installed"
+    _skill_md(root / "good-skill", "good-skill")
+    (root / "good-skill" / "marker").write_text("previous")
+    src = tmp_path / "new"
+    _skill_md(src, "good-skill")
+    real_write = Path.write_text
+
+    def fail_provenance(path, *args, **kwargs):
+        if path.name == ".parsec-provenance.json":
+            raise OSError(28, "No space left on device")
+        return real_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_provenance)
+    with pytest.raises(OSError):
+        skills_routes._replace_skill_dir(
+            src, root / "good-skill", root / ".staging", {"source": "new"}
+        )
+    assert (root / "good-skill" / "marker").read_text() == "previous"
+    assert list((root / ".staging").iterdir()) == []
+
+
+def test_interrupted_swap_restores_previous_copy_before_retry(tmp_path, monkeypatch):
+    root = tmp_path / "installed"
+    previous = root / ".staging" / "good-skill.previous"
+    _skill_md(previous, "good-skill")
+    (previous / "marker").write_text("previous")
+
+    def disk_full(*args):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(skills_routes, "copy_skill_tree", disk_full)
+    with pytest.raises(OSError):
+        skills_routes._replace_skill_dir(tmp_path / "new", root / "good-skill", root / ".staging")
+    assert (root / "good-skill" / "marker").read_text() == "previous"
+
+
+def test_final_rename_failure_restores_previous_copy(tmp_path, monkeypatch):
+    root = tmp_path / "installed"
+    dest = root / "good-skill"
+    _skill_md(dest, "good-skill")
+    (dest / "marker").write_text("previous")
+    src = tmp_path / "new"
+    _skill_md(src, "good-skill")
+    real_rename = Path.rename
+
+    def fail_swap(path, target):
+        if path == root / ".staging" / "good-skill":
+            raise OSError("swap failed")
+        return real_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_swap)
+    with pytest.raises(OSError, match="swap failed"):
+        skills_routes._replace_skill_dir(src, dest, root / ".staging")
+    assert (dest / "marker").read_text() == "previous"
+    assert list((root / ".staging").iterdir()) == []
 
 
 # ------------------------------------------------ end to end: symlinks

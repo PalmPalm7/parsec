@@ -54,6 +54,7 @@ from src.skills.attachment import (
     load_state,
     resolve,
     save_override,
+    state_lock,
     state_path,
 )
 from src.skills.health import assess, build_tool_surface
@@ -570,7 +571,7 @@ async def uninstall_skill(
             detail=f"{name!r} is not an installed skill (in-repo skills are removed by a PR, not here)",
         )
 
-    await run_in_threadpool(shutil.rmtree, target)
+    await run_in_threadpool(_remove_skill_dir, target)
 
     # Republish so the SDK root loses its symlink on the same request.
     try:
@@ -696,23 +697,51 @@ async def _init_submodules(
 _STAGING_DIRNAME = ".staging"
 
 
-def _replace_skill_dir(src: Path, dest: Path, staging_root: Path) -> list[str]:
+def _remove_skill_dir(target: Path) -> None:
+    """Use the same lock as install so deletion cannot interrupt a replacement."""
+    with state_lock(target):
+        if not target.is_dir():
+            raise HTTPException(status_code=404, detail="Skill is no longer installed")
+        shutil.rmtree(target)
+
+
+def _replace_skill_dir(
+    src: Path, dest: Path, staging_root: Path, provenance: dict[str, Any] | None = None
+) -> list[str]:
     """Install ``src`` at ``dest``, keeping the previous ``dest`` until the new one is in place.
 
     Deleting ``dest`` before copying meant a failed copy — disk full, an
     unreadable file — lost a skill that was working a moment earlier. The copy
     now lands in staging first; ``dest`` is only moved aside once it has
     succeeded, and is put back if the final rename fails. Returns the links
-    :func:`copy_skill_tree` skipped.
+    :func:`copy_skill_tree` skipped. A per-skill inter-process lock protects
+    staging and the swap; provenance travels with the staged payload.
     """
+    with state_lock(dest):
+        return _replace_skill_dir_locked(src, dest, staging_root, provenance)
+
+
+def _replace_skill_dir_locked(
+    src: Path, dest: Path, staging_root: Path, provenance: dict[str, Any] | None
+) -> list[str]:
     staging_root.mkdir(exist_ok=True)
     staged = staging_root / dest.name
     previous = staging_root / f"{dest.name}.previous"
+    # A process may have died after moving the old copy aside. Restore it
+    # before attempting another copy, so another failure cannot destroy it.
+    if previous.exists() and not dest.exists():
+        previous.rename(dest)
     for leftover in (staged, previous):
         if leftover.exists():
             shutil.rmtree(leftover)
     try:
         links = copy_skill_tree(src, staged)
+        if provenance is not None:
+            (staged / ".parsec-provenance.json").write_text(
+                json.dumps({**provenance, "skipped_symlinks": links}, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
     except BaseException:
         _rmtree_logged(staged)
         raise
@@ -882,16 +911,8 @@ def _install_from_clone(
         )
 
     root.mkdir(parents=True, exist_ok=True)
-    installed: list[str] = []
+    installed = [m.name for m in selected]
     skipped_symlinks: dict[str, list[str]] = {}
-    for m in selected:
-        links = _replace_skill_dir(m.skill_path, root / m.name, root / _STAGING_DIRNAME)
-        if links:
-            logger.warning("Installed %s without its symlinks: %s", m.name, links)
-            skipped_symlinks[m.name] = links
-        installed.append(m.name)
-
-    origin = {m.name: str(m.skill_path.relative_to(clone_dir)) for m in manifests}
     provenance = {
         "repo_url": repo_url,
         "ref": ref,
@@ -901,27 +922,19 @@ def _install_from_clone(
         "skills": installed,
         "requested": sorted(only) if only is not None else None,
     }
-    # One record per installed skill, inside the skill. A single file at the
-    # install root would be read by every skill sharing that root via the
-    # parent lookup, so a later bundle would silently relabel an earlier
-    # one — and it would outlive an uninstall as a stale claim of provenance.
-    for name in installed:
-        try:
-            (root / name / ".parsec-provenance.json").write_text(
-                json.dumps(
-                    {
-                        **provenance,
-                        "skill": name,
-                        "source_path": origin.get(name),
-                        "skipped_symlinks": skipped_symlinks.get(name, []),
-                    },
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            logger.exception("Installed %s but could not write its provenance", name)
+    for m in selected:
+        links = _replace_skill_dir(
+            m.skill_path,
+            root / m.name,
+            root / _STAGING_DIRNAME,
+            {
+                **provenance,
+                "skill": m.name,
+                "source_path": str(m.skill_path.relative_to(clone_dir)),
+            },
+        )
+        if links:
+            logger.warning("Installed %s without its symlinks: %s", m.name, links)
+            skipped_symlinks[m.name] = links
 
     return _InstallResult(installed, sha, skipped_symlinks, skipped_skills)
