@@ -113,5 +113,29 @@ class TestClassifyFast:
     def test_generic_question_returns_none(self):
         assert classify_fast("Hello, how are you?") is None
 
+    # --- Later domains are no longer pre-empted by earlier ones ---
+    def test_icinga_question_about_a_babylon_named_host(self):
+        """A hostname containing "babylon" must not decide the route.
+
+        `\bbabylon\b` matches inside a hostname, and babylon was tested before
+        icinga with no guard against it, so every Icinga question about a host
+        named this way routed to the babylon agent.
+        """
+        assert (
+            classify_fast("What is the monitoring status of host babylon-ocp-prod-us-east-1?")
+            is None
+        )
+
+    def test_icinga_question_about_an_ocpv_cluster(self):
+        """Same shape with no babylon mention at all: ocpv preceded icinga."""
+        assert classify_fast("Acknowledge the critical alert on ocpv08") is None
+
+    def test_icinga_still_fast_paths_when_unambiguous(self):
+        """The guard must not cost the fast path when only icinga matches."""
+        assert classify_fast("Check icinga for problems") == "icinga"
+
+    def test_ocpv_still_fast_paths_when_unambiguous(self):
+        assert classify_fast("Why is the PVC stuck pending?") == "ocpv"
+
     def test_empty_string_returns_none(self):
         assert classify_fast("") is None
