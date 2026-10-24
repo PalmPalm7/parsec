@@ -1,15 +1,8 @@
-"""MLflow tracing for the Claude Agent SDK subprocess.
+"""Configure MLflow's existing Claude SDK tracing integration.
 
-The environment below configures an independently installed MLflow CLI tracing
-plugin/hook; it does not install instrumentation. Parsec's full SDK orchestrator
-and MCP bridge emit application spans explicitly via ``src.metrics.sdk_tracing``
-so their traces do not depend on external CLI setup.
-
-When ``mlflow.tracking_url`` is empty, :func:`build_tracing_env` returns ``{}``.
-
-The env vars are consumed by MLflow's Claude Code integration
-(``MLFLOW_CLAUDE_TRACING_ENABLED`` + ``MLFLOW_TRACKING_URI`` /
-``MLFLOW_EXPERIMENT_NAME``).
+Environment variables configure an installed CLI integration; they do not
+install instrumentation. Successful MLflow initialization enables the built-in
+ClaudeSDKClient autolog hook for full SDK orchestration.
 """
 
 from __future__ import annotations
@@ -24,6 +17,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_EXPERIMENT = "parsec-agent-metrics"
 
 
+def enable_sdk_tracing(config: Any) -> None:
+    """Hook the existing SDK client; keep legacy manual spans unchanged."""
+    from src.llm import RUNTIME_SDK, get_runtime
+
+    sdk_cfg = section(section(config, "agent"), "sdk")
+    if get_runtime(config) == RUNTIME_SDK and sdk_cfg.get("orchestrator", False):
+        import mlflow.anthropic
+
+        mlflow.anthropic.autolog()
+
+
 def build_tracing_env(config: Any) -> dict[str, str]:
     """Derive the MLflow tracing env for the SDK subprocess from ``mlflow.*`` config.
 
@@ -31,8 +35,9 @@ def build_tracing_env(config: Any) -> dict[str, str]:
     SDK runtime without MLflow configured exports nothing (matching the legacy
     collector's no-op semantics).
 
-    Mirrors ``src.connections.mlflow_tracking.init_mlflow`` so an installed CLI
-    integration and the app-side collector use the same destination.
+    Mirrors the reads in ``src.connections.mlflow_tracking.init_mlflow`` so the
+    SDK subprocess and the app-side collector point at the same server /
+    experiment / credentials.
     """
     mlflow_cfg = section(config, "mlflow")
     tracking_url = str(mlflow_cfg.get("tracking_url", "") or "").strip()

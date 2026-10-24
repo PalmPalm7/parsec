@@ -364,9 +364,9 @@ class AgentSdkClient:
         )
         cwd = sdk_section.get("cwd") or os.getcwd()
         setting_sources_raw = sdk_section.get("setting_sources", ["project"]) or ["project"]
-        # Destination for an optionally installed CLI tracing integration; env
-        # variables alone do not install its plugin/hooks. The full SDK
-        # orchestrator emits application spans explicitly. Operator env wins.
+        # MLflow tracing env is derived from mlflow.* so the SDK subprocess
+        # exports its own claude_code.* spans when tracking is enabled. An
+        # explicit agent.sdk.env wins on conflict (operator override).
         explicit_env = sdk_section.get("env", {}) or {}
         extra_env = {**build_tracing_env(config), **explicit_env}
         timeout_raw = sdk_section.get("timeout", 300.0)

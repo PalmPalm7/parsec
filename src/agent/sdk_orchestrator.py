@@ -29,7 +29,6 @@ produced them.
 from __future__ import annotations
 
 import logging
-import uuid
 from collections.abc import AsyncGenerator, Iterable
 from typing import Any, cast
 
@@ -190,7 +189,7 @@ def _union_tool_schemas() -> list[dict]:
     return list(seen.values())
 
 
-def build_orchestrator_options(config: Any, *, system: str, trace_parent: Any = None) -> Any:
+def build_orchestrator_options(config: Any, *, system: str) -> Any:
     """Assemble ``ClaudeAgentOptions`` for one orchestrator turn."""
     from claude_agent_sdk import ClaudeAgentOptions
 
@@ -207,7 +206,7 @@ def build_orchestrator_options(config: Any, *, system: str, trace_parent: Any = 
     allow_writes = bool(sdk_cfg.get("allow_writes", False))
 
     schemas = _union_tool_schemas()
-    server = build_server(schemas, allow_writes=allow_writes, trace_parent=trace_parent)
+    server = build_server(schemas, allow_writes=allow_writes)
 
     # Auto-approve every bridged tool, not just the orchestrator's own.
     #
@@ -384,13 +383,9 @@ async def run_agent_via_sdk(
     from src.agent.streaming import sse_done, sse_error
     from src.config import get_config
     from src.metrics.collector import MetricsCollector
-    from src.metrics.sdk_tracing import end_sdk_span, start_sdk_span
-    from src.metrics.tracing import SpanType
 
     cfg = get_config()
-    session_id = session_id or conversation_id or str(uuid.uuid4())
-    collector = MetricsCollector(conversation_id=conversation_id or session_id)
-    collector.start_timer()
+    collector = MetricsCollector(conversation_id=conversation_id or session_id or "")
     collector.record_runtime("sdk")
     collector.record_agent_dispatch("orchestrator", routing_method="sdk")
 
@@ -401,71 +396,44 @@ async def run_agent_via_sdk(
         question=question, history=conversation_history or [], config=cfg
     )
 
-    root_span = start_sdk_span(
-        "parsec:orchestrator",
-        SpanType.CHAIN,
-        {"question": question},
-        attributes={"runtime": "sdk", "agent_type": "orchestrator", "routing_method": "sdk"},
-        metadata={
-            "mlflow.trace.session": session_id,
-            "conversation_id": conversation_id or session_id,
-            "runtime": "sdk",
-        },
-    )
-    error = "SDK stream closed before completion"
     try:
-        try:
-            options = build_orchestrator_options(
-                cfg, system=_orchestrator_system(cfg), trace_parent=root_span
-            )
-        except Exception as e:
-            logger.exception("Failed to build SDK orchestrator options")
-            error = f"SDK orchestrator unavailable: {e}"
-            terminal_events = [sse_error(error), sse_done()]
-        else:
-            # Bound handlers share this turn's trace parent even when the SDK
-            # invokes them from a task without the caller's active span context.
-            from src.agent.orchestrator import _tool_cache  # local: avoids a cycle
+        options = build_orchestrator_options(cfg, system=_orchestrator_system(cfg))
+    except Exception as e:
+        logger.exception("Failed to build SDK orchestrator options")
+        yield sse_error(f"SDK orchestrator unavailable: {e}")
+        yield sse_done()
+        return
 
-            cache_token = _tool_cache.set({})
-            token = sse_sink.set(translator.push)
-            sdk_error = ""
-            try:
-                from claude_agent_sdk import ClaudeSDKClient
+    prompt = translator.build_prompt()
 
-                async with ClaudeSDKClient(options) as client:
-                    await client.query(translator.build_prompt())
-                    async for message in client.receive_response():
-                        for event in translator.translate(message):
-                            yield event
-                        for event in translator.drain():
-                            yield event
-            except Exception as e:
-                logger.exception("SDK orchestrator failed")
-                sdk_error = str(e)
-                yield sse_error(sdk_error)
-            finally:
-                sse_sink.reset(token)
-                _tool_cache.reset(cache_token)
+    # The bridge pushes tool events onto the same queue the translator drains,
+    # so a tool call inside a subagent still reaches the browser.
+    # The bridge's per-request tool-result cache lives in a ContextVar that the
+    # legacy path sets after this function returns, so on the SDK path it was
+    # never initialised and every repeated tool call re-executed. Set it here,
+    # in the same place and for the same lifetime as sse_sink.
+    from src.agent.orchestrator import _tool_cache  # local: avoids a cycle
 
-            # Finish records usage before the trace ends. Materialize only the
-            # few terminal events so the trace is complete before yielding done.
-            terminal_events = list(translator.finish(collector))
-            error = sdk_error or translator.failure_reason
+    cache_token = _tool_cache.set({})
+
+    token = sse_sink.set(translator.push)
+    try:
+        from claude_agent_sdk import ClaudeSDKClient
+
+        async with ClaudeSDKClient(options) as client:
+            await client.query(prompt)
+            async for message in client.receive_response():
+                for event in translator.translate(message):
+                    yield event
+                # Drain anything the bridge queued while that message was handled.
+                for event in translator.drain():
+                    yield event
+    except Exception as e:
+        logger.exception("SDK orchestrator failed")
+        yield sse_error(str(e))
     finally:
-        end_sdk_span(
-            root_span,
-            {"response": translator.answer},
-            attributes={
-                "model": collector.model,
-                "sdk_session_id": translator.session_id or "",
-                "gen_ai.usage.input_tokens": collector.input_tokens,
-                "gen_ai.usage.output_tokens": collector.output_tokens,
-                "gen_ai.usage.total_tokens": collector.input_tokens + collector.output_tokens,
-                "cost_usd": collector.resolved_cost_usd(),
-            },
-            error=error,
-        )
+        sse_sink.reset(token)
+        _tool_cache.reset(cache_token)
 
-    for event in terminal_events:
+    for event in translator.finish(collector):
         yield event
