@@ -81,7 +81,9 @@ def tool_names_for(schemas: list[dict]) -> list[str]:
     return [f"mcp__{SERVER_NAME}__{s['name']}" for s in schemas]
 
 
-def build_server(schemas: list[dict], *, allow_writes: bool = False) -> Any:
+def build_server(
+    schemas: list[dict], *, allow_writes: bool = False, trace_parent: Any = None
+) -> Any:
     """Build an SDK MCP server exposing ``schemas``.
 
     Args:
@@ -90,6 +92,7 @@ def build_server(schemas: list[dict], *, allow_writes: bool = False) -> Any:
             discovered Reporting-MCP ``db_*`` tools are included.
         allow_writes: When False (the default) the Icinga write actions in
             :data:`WRITE_ACTIONS` are refused inside the handler.
+        trace_parent: This turn's root span, bound into each tool handler.
 
     Returns:
         An SDK MCP server instance for ``ClaudeAgentOptions(mcp_servers=...)``.
@@ -115,7 +118,9 @@ def build_server(schemas: list[dict], *, allow_writes: bool = False) -> Any:
         name = schema["name"]
         description = (schema.get("description") or "")[:_MAX_DESCRIPTION_CHARS]
         input_schema = schema.get("input_schema") or {"type": "object", "properties": {}}
-        handlers.append(tool(name, description, input_schema)(_make_handler(name, allow_writes)))
+        handlers.append(
+            tool(name, description, input_schema)(_make_handler(name, allow_writes, trace_parent))
+        )
 
     logger.info(
         "Parsec MCP bridge: %d tools (writes %s)",
@@ -125,7 +130,9 @@ def build_server(schemas: list[dict], *, allow_writes: bool = False) -> Any:
     return create_sdk_mcp_server(name=SERVER_NAME, version="1.0.0", tools=handlers)
 
 
-def _make_handler(name: str, allow_writes: bool) -> Callable[[dict], Awaitable[dict]]:
+def _make_handler(
+    name: str, allow_writes: bool, trace_parent: Any = None
+) -> Callable[[dict], Awaitable[dict]]:
     """Build the MCP handler for one tool.
 
     Bound as a default argument rather than a closure variable so each handler
@@ -141,7 +148,7 @@ def _make_handler(name: str, allow_writes: bool) -> Callable[[dict], Awaitable[d
         if sink is not None:
             await _emit(sink, "tool_start", _name, args)
 
-        result = await _dispatch_cached(_name, args)
+        result = await _dispatch_cached(_name, args, trace_parent=trace_parent)
 
         if sink is not None:
             await _emit(sink, "tool_result", _name, result)
@@ -177,7 +184,7 @@ def _refuse_write(name: str, args: dict, allow_writes: bool) -> dict | None:
     }
 
 
-async def _dispatch_cached(name: str, args: dict) -> dict:
+async def _dispatch_cached(name: str, args: dict, *, trace_parent: Any = None) -> dict:
     """Run the tool through the orchestrator, honouring the per-request cache.
 
     Mirrors the legacy loop: cache hits skip execution, uncacheable tools always
@@ -185,6 +192,37 @@ async def _dispatch_cached(name: str, args: dict) -> dict:
     propagating — the SDK would otherwise surface a transport failure instead of
     letting the model react to a failed tool.
     """
+    from src.metrics.sdk_tracing import end_sdk_span, start_sdk_span
+    from src.metrics.tracing import SpanType
+
+    # The MCP runtime can dispatch in a separate task. An explicit parent also
+    # prevents another concurrent request's active context from owning this tool.
+    span = (
+        start_sdk_span(
+            name,
+            SpanType.TOOL,
+            {"tool_name": name, "tool_input": args},
+            parent_span=trace_parent,
+        )
+        if trace_parent is not None
+        else None
+    )
+    cached = False
+    result: dict = {"error": "Tool call cancelled before completion"}
+    try:
+        result, cached = await _dispatch_cached_result(name, args)
+        return result
+    finally:
+        end_sdk_span(
+            span,
+            {"tool_name": name, "result": result, "cached": cached},
+            attributes={"cached": cached},
+            error=str(result.get("error", "")) if isinstance(result, dict) else "",
+        )
+
+
+async def _dispatch_cached_result(name: str, args: dict) -> tuple[dict, bool]:
+    """Return the existing result plus whether it came from this request's cache."""
     from src.agent.orchestrator import (
         _UNCACHEABLE_TOOLS,
         _cache_key,
@@ -201,17 +239,17 @@ async def _dispatch_cached(name: str, args: dict) -> dict:
     key = _cache_key(name, args) if cache is not None else ""
 
     if cache is not None and key in cache:
-        return cache[key]
+        return cache[key], True
 
     try:
         result = await _execute_tool(name, args)
     except Exception as e:  # noqa: BLE001 - parity with the legacy tool loop
         logger.exception("Bridged tool %s failed", name)
-        return {"error": str(e)}
+        return {"error": str(e)}, False
 
     if cache is not None and isinstance(result, dict) and "error" not in result:
         cache[key] = result
-    return result
+    return result, False
 
 
 async def _emit(sink: Callable[[str], Awaitable[None]], kind: str, name: str, payload: Any) -> None:

@@ -344,6 +344,11 @@ class SdkEventTranslator:
         return "".join(self._text_parts).strip()
 
     @property
+    def failure_reason(self) -> str:
+        """Expose the same completion status to tracing and the SSE response."""
+        return self._failure_reason()
+
+    @property
     def session_id(self) -> str | None:
         return self._session_id
 

@@ -1,16 +1,11 @@
 """MLflow tracing for the Claude Agent SDK subprocess.
 
-The Agent SDK runs the Claude Code CLI in a child process. Unlike the legacy
-path — which logs metrics from app code via ``src.connections.mlflow_tracking``
-— the SDK path is best traced the way RHDP already traces Claude Code itself:
-**by environment**, so the subprocess exports its own `claude_code.*` spans
-(token usage, per-turn latency, tool calls) to the same MLflow server.
+The environment below configures an independently installed MLflow CLI tracing
+plugin/hook; it does not install instrumentation. Parsec's full SDK orchestrator
+and MCP bridge emit application spans explicitly via ``src.metrics.sdk_tracing``
+so their traces do not depend on external CLI setup.
 
-This module derives that tracing configuration from Parsec's existing
-``mlflow.*`` config so the SDK runtime exports traces automatically when MLflow
-is enabled — no extra wiring at the call site. When ``mlflow.tracking_url`` is
-empty (the default), :func:`build_tracing_env` returns ``{}`` and nothing is
-exported, exactly like the legacy collector's no-op behavior.
+When ``mlflow.tracking_url`` is empty, :func:`build_tracing_env` returns ``{}``.
 
 The env vars are consumed by MLflow's Claude Code integration
 (``MLFLOW_CLAUDE_TRACING_ENABLED`` + ``MLFLOW_TRACKING_URI`` /
@@ -36,9 +31,8 @@ def build_tracing_env(config: Any) -> dict[str, str]:
     SDK runtime without MLflow configured exports nothing (matching the legacy
     collector's no-op semantics).
 
-    Mirrors the reads in ``src.connections.mlflow_tracking.init_mlflow`` so the
-    SDK subprocess and the app-side collector point at the same server /
-    experiment / credentials.
+    Mirrors ``src.connections.mlflow_tracking.init_mlflow`` so an installed CLI
+    integration and the app-side collector use the same destination.
     """
     mlflow_cfg = section(config, "mlflow")
     tracking_url = str(mlflow_cfg.get("tracking_url", "") or "").strip()
